@@ -529,7 +529,7 @@ bool D3D11InitParams::IsSupportedVersion(uint64_t ver)
     return true;
 
   // 0x13 -> 0x14 - added serialised annotations
-  if(ver == 0x12)
+  if(ver == 0x13)
     return true;
 
   return false;

@@ -23,13 +23,12 @@
     <ProjectGuid>{EC8C6087-E99E-44B3-B8DC-3C9FE7907F47}</ProjectGuid>
     <RootNamespace>demos</RootNamespace>
     <ProjectName>demos</ProjectName>
-    <WindowsTargetPlatformVersion>8.1</WindowsTargetPlatformVersion>
   </PropertyGroup>
+  <Import Project="$(SolutionDir)\..\WindowsSDKTarget.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v140</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
@@ -40,6 +39,11 @@
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <!-- WindowsSDKFix is relative to parent solution, replicate it here -->
+  <!-- <Import Project="$(SolutionDir)\..\WindowsSDKFix.props" /> -->
+  <PropertyGroup>
+    <IncludePath>$(SolutionDir)\..\sdkfix;$(IncludePath)</IncludePath>
+  </PropertyGroup>
   <PropertyGroup>
     <OutDir>$(SolutionDir)</OutDir>
     <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
@@ -218,6 +222,7 @@
     <ClCompile Include="d3d12\d3d12_overlay_test.cpp" />
     <ClCompile Include="d3d12\d3d12_parameter_zoo.cpp" />
     <ClCompile Include="d3d12\d3d12_pixel_history.cpp" />
+    <ClCompile Include="d3d12\d3d12_predication.cpp" />
     <ClCompile Include="d3d12\d3d12_primitiveid.cpp" />
     <ClCompile Include="d3d12\d3d12_reflection_zoo.cpp" />
     <ClCompile Include="d3d12\d3d12_rendertarget_binds.cpp" />
@@ -332,6 +337,7 @@
     <ClCompile Include="vk\vk_dynamic_rendering.cpp" />
     <ClCompile Include="vk\vk_empty_capture.cpp" />
     <ClCompile Include="vk\vk_extended_dyn_state.cpp" />
+    <ClCompile Include="vk\vk_custom_resolve.cpp" />
     <ClCompile Include="vk\vk_graphics_pipeline.cpp" />
     <ClCompile Include="vk\vk_groupshared.cpp" />
     <ClCompile Include="vk\vk_khr_buffer_address.cpp" />
@@ -356,6 +362,7 @@
     <ClCompile Include="vk\vk_query_pool.cpp" />
     <ClCompile Include="vk\vk_ray_query.cpp" />
     <ClCompile Include="vk\vk_read_before_overwrite.cpp" />
+    <ClCompile Include="vk\vk_resource_usage.cpp" />
     <ClCompile Include="vk\vk_robustness2.cpp" />
     <ClCompile Include="vk\vk_separate_depth_stencil_layouts.cpp" />
     <ClCompile Include="vk\vk_shader_debug_zoo.cpp" />

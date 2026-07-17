@@ -560,7 +560,7 @@ WrappedID3D12CommandQueue::~WrappedID3D12CommandQueue()
 {
   SAFE_DELETE(m_FrameReader);
 
-  SAFE_RELEASE(m_RayFence);
+  SAFE_RELEASE(m_CallbackFence);
 
   for(SDObject *o : m_Cmd.m_EventAnnotations)
     delete o;
@@ -682,8 +682,8 @@ HRESULT STDMETHODCALLTYPE WrappedID3D12CommandQueue::QueryInterface(REFIID riid,
 void WrappedID3D12CommandQueue::CheckAndFreeRayDispatches()
 {
   UINT64 signalled = 0;
-  if(m_RayFence)
-    signalled = m_RayFence->GetCompletedValue();
+  if(m_CallbackFence)
+    signalled = m_CallbackFence->GetCompletedValue();
 
   for(PatchedRayDispatch::Resources &ray : m_RayDispatchesPending)
   {
@@ -1335,7 +1335,8 @@ RDResult WrappedID3D12CommandQueue::ReplayLog(CaptureState readType, uint32_t st
     // boundaries, the event IDs would no longer match up).
     if(m_Cmd.m_LastCmdListID == ResourceId() || startEventID > 1)
     {
-      m_Cmd.m_RootEventID++;
+      if(context != D3D12Chunk::SetQueueAnnotation)
+        m_Cmd.m_RootEventID++;
 
       if(startEventID > 1)
         ser.GetReader()->SetOffset(GetEvent(m_Cmd.m_RootEventID).fileOffset);
@@ -1457,7 +1458,7 @@ WrappedID3D12GraphicsCommandList::~WrappedID3D12GraphicsCommandList()
   m_UnusedCleanupCallbacks.clear();
 
   if(m_pList)
-    m_pDevice->GetResourceManager()->RemoveWrapper(m_pList);
+    m_pDevice->GetResourceManager()->RemoveWrapper(this, m_pList);
 
   if(m_CreationRecord)
     m_CreationRecord->Delete(m_pDevice->GetResourceManager());

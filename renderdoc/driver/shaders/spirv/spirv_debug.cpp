@@ -2234,17 +2234,21 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       for(uint8_t c = 0; c < var.columns; c++)
       {
 #undef _IMPL
-#define _IMPL(I, S, U)                               \
-  const U mask = (U(1) << comp<U>(count, c)) - U(1); \
-                                                     \
-  comp<U>(var, c) >>= comp<U>(offset, c);            \
-  comp<U>(var, c) &= mask;                           \
-                                                     \
-  if(opdata.op == Op::BitFieldSExtract)              \
-  {                                                  \
-    U topbit = (mask + U(1)) >> U(1);                \
-    if(comp<U>(var, c) & topbit)                     \
-      comp<U>(var, c) |= (~0ULL ^ mask);             \
+#define _IMPL(I, S, U)                        \
+  const U bitcount = comp<U>(count, c);       \
+  if(bitcount < sizeof(U) * 8)                \
+  {                                           \
+    const U mask = (U(1) << bitcount) - U(1); \
+                                              \
+    comp<U>(var, c) >>= comp<U>(offset, c);   \
+    comp<U>(var, c) &= mask;                  \
+                                              \
+    if(opdata.op == Op::BitFieldSExtract)     \
+    {                                         \
+      U topbit = (mask + U(1)) >> U(1);       \
+      if(comp<U>(var, c) & topbit)            \
+        comp<U>(var, c) |= (~0ULL ^ mask);    \
+    }                                         \
   }
 
         IMPL_FOR_INT_TYPES(_IMPL);
@@ -3999,7 +4003,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
         QueueSampleGather(Op::ImageFetch, texType, img.GetBindIndex(), ShaderBindIndex(), coord,
                           ShaderVariable(), ShaderVariable(), ShaderVariable(), GatherChannel::Red,
-                          ImageOperandsAndParamDatas(), result);
+                          read.imageOperands, result);
       }
       else
       {
@@ -4889,6 +4893,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       ShaderVariable acc;
       bool leftSigned = true;
       bool rightSigned = true;
+      PackedVectorFormat packedFormat = PackedVectorFormat::Invalid;
+      bool hasPackedFormat = false;
       switch(opdata.op)
       {
         case Op::SDot:
@@ -4897,6 +4903,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           vector1 = dot.vector1;
           vector2 = dot.vector2;
           result = dot.result;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         case Op::SDotAccSat:
@@ -4906,6 +4914,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           vector2 = dot.vector2;
           acc = GetSrc(dot.accumulator);
           result = dot.result;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         case Op::UDot:
@@ -4916,6 +4926,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           result = dot.result;
           leftSigned = false;
           rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         case Op::UDotAccSat:
@@ -4927,6 +4939,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           result = dot.result;
           leftSigned = false;
           rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         case Op::SUDot:
@@ -4936,6 +4950,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           vector2 = dot.vector2;
           result = dot.result;
           rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         case Op::SUDotAccSat:
@@ -4946,6 +4962,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           acc = GetSrc(dot.accumulator);
           result = dot.result;
           rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
           break;
         }
         default: RDCERR("Unexpected opcode %s", ToStr(opdata.op).c_str()); break;
@@ -4956,14 +4974,33 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
       RDCASSERTEQUAL(lhs.columns, rhs.columns);
       // 1x32-bit is a 4x-8bit packed vector
-      bool packed = false;
       if((lhs.columns == 1) && (lhs.type == VarType::SInt || lhs.type == VarType::UInt))
       {
         lhs.columns = 4;
         rhs.columns = 4;
         lhs.type = (lhs.type == VarType::SInt) ? VarType::SByte : VarType::UByte;
         rhs.type = (rhs.type == VarType::SInt) ? VarType::SByte : VarType::UByte;
-        packed = true;
+        if(!hasPackedFormat)
+        {
+          RDCERR("Inputs are packed but opcode does not specify packed format opcode %s",
+                 ToStr(opdata.op).c_str());
+          break;
+        }
+        if(packedFormat != PackedVectorFormat::PackedVectorFormat4x8Bit)
+        {
+          RDCERR("Inputs are packed but opcdode specifies an invalid packed format %u opcode %s",
+                 (uint32_t)packedFormat, ToStr(opdata.op).c_str());
+          break;
+        }
+      }
+      else
+      {
+        if(hasPackedFormat)
+        {
+          RDCERR("Inputs are not packed but opcode does specify packed format opcode %s",
+                 ToStr(opdata.op).c_str());
+          break;
+        }
       }
       const DataType &resultType = debugger.GetType(opdata.resultType);
       ShaderVariable var;
@@ -5006,7 +5043,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 #undef _IMPL
 #define _IMPL(I, S, U)                                  \
   int64_t ret(0);                                       \
-  if(!packed)                                           \
+  if(!hasPackedFormat)                                  \
   {                                                     \
     for(uint8_t c = 0; c < lhs.columns; c++)            \
       ret += comp<S>(lhs, c) * comp<S>(rhs, c);         \
@@ -5027,7 +5064,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 #undef _IMPL
 #define _IMPL(I, S, U)                                  \
   uint64_t ret(0);                                      \
-  if(!packed)                                           \
+  if(!hasPackedFormat)                                  \
   {                                                     \
     for(uint8_t c = 0; c < lhs.columns; c++)            \
       ret += comp<U>(lhs, c) * comp<U>(rhs, c);         \
@@ -5048,7 +5085,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 #undef _IMPL
 #define _IMPL(I, S, U)                                  \
   int64_t ret(0);                                       \
-  if(!packed)                                           \
+  if(!hasPackedFormat)                                  \
   {                                                     \
     for(uint8_t c = 0; c < lhs.columns; c++)            \
       ret += comp<S>(lhs, c) * comp<U>(rhs, c);         \
@@ -5142,7 +5179,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::FragmentMaskFetchAMD:
     case Op::FragmentFetchAMD:
     case Op::ImageSampleFootprintNV:
-    case Op::GroupNonUniformPartitionNV:
+    case Op::GroupNonUniformPartitionEXT:
     case Op::WritePackedPrimitiveIndices4x8NV:
     case Op::ReportIntersectionKHR:
     case Op::IgnoreIntersectionNV:
@@ -5346,6 +5383,52 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::CompositeExtractCoopMatQCOM:
     case Op::ExtractSubArrayQCOM:
     case Op::FmaKHR:
+    case Op::BufferPointerEXT:
+    case Op::UntypedImageTexelPointerEXT:
+    case Op::ConstantSizeOfEXT:
+    case Op::HitObjectRecordFromQueryEXT:
+    case Op::HitObjectRecordMissMotionEXT:
+    case Op::HitObjectGetIntersectionTriangleVertexPositionsEXT:
+    case Op::HitObjectGetRayFlagsEXT:
+    case Op::HitObjectSetShaderBindingTableRecordIndexEXT:
+    case Op::HitObjectReorderExecuteShaderEXT:
+    case Op::HitObjectTraceMotionReorderExecuteEXT:
+    case Op::ReorderThreadWithHintEXT:
+    case Op::ReorderThreadWithHitObjectEXT:
+    case Op::HitObjectTraceRayEXT:
+    case Op::HitObjectTraceRayMotionEXT:
+    case Op::HitObjectRecordEmptyEXT:
+    case Op::HitObjectExecuteShaderEXT:
+    case Op::HitObjectGetCurrentTimeEXT:
+    case Op::HitObjectRecordMissEXT:
+    case Op::HitObjectTraceReorderExecuteEXT:
+    case Op::HitObjectGetAttributesEXT:
+    case Op::HitObjectGetPrimitiveIndexEXT:
+    case Op::HitObjectGetGeometryIndexEXT:
+    case Op::HitObjectGetInstanceIdEXT:
+    case Op::HitObjectGetInstanceCustomIndexEXT:
+    case Op::HitObjectGetHitKindEXT:
+    case Op::HitObjectGetObjectRayOriginEXT:
+    case Op::HitObjectGetObjectRayDirectionEXT:
+    case Op::HitObjectGetWorldRayDirectionEXT:
+    case Op::HitObjectGetWorldRayOriginEXT:
+    case Op::HitObjectGetObjectToWorldEXT:
+    case Op::HitObjectGetWorldToObjectEXT:
+    case Op::HitObjectGetRayTMaxEXT:
+    case Op::HitObjectGetRayTMinEXT:
+    case Op::HitObjectGetShaderBindingTableRecordIndexEXT:
+    case Op::HitObjectGetShaderRecordBufferHandleEXT:
+    case Op::HitObjectIsEmptyEXT:
+    case Op::HitObjectIsHitEXT:
+    case Op::HitObjectIsMissEXT:
+    case Op::AbortKHR:
+    case Op::PoisonKHR:
+    case Op::FreezeKHR:
+    case Op::BitcastExtractEXT:
+    case Op::FDot2MixAcc16VALVE:
+    case Op::FDot2MixAcc32VALVE:
+    case Op::FDot4MixAcc32VALVE:
+    case Op::ImageGatherQCOM:
     {
       RDCERR("Unsupported extension opcode used %s", ToStr(opdata.op).c_str());
 
@@ -5415,12 +5498,17 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::TypeNodePayloadArrayAMDX:
     case Op::ConstantStringAMDX:
     case Op::SpecConstantStringAMDX:
-    case Op::TypeCooperativeVectorNV:
+    case Op::TypeVectorIdEXT:
     case Op::TypeTensorLayoutNV:
     case Op::TypeTensorViewNV:
     case Op::TypeGraphARM:
     case Op::TypeHitObjectNV:
     case Op::TypeCooperativeMatrixKHR:
+    case Op::TypeBufferEXT:
+    case Op::MemberDecorateIdEXT:
+    case Op::TypeHitObjectEXT:
+    case Op::ConstantDataKHR:
+    case Op::SpecConstantDataKHR:
     {
       RDCERR("Encountered unexpected global SPIR-V operation %s", ToStr(opdata.op).c_str());
       break;
@@ -5486,8 +5574,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::TypePipeStorage:
     case Op::ConstantPipeStorage:
     case Op::CreatePipeFromPipeStorage:
-    case Op::ControlBarrierArriveINTEL:
-    case Op::ControlBarrierWaitINTEL:
+    case Op::ControlBarrierArriveEXT:
+    case Op::ControlBarrierWaitEXT:
     case Op::SubgroupMatrixMultiplyAccumulateINTEL:
     case Op::SubgroupBlockPrefetchINTEL:
     case Op::Subgroup2DBlockLoadINTEL:
@@ -5515,6 +5603,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::ConvertHandleToSamplerINTEL:
     case Op::SpecConstantCapabilitiesINTEL:
     case Op::ConditionalCopyObjectINTEL:
+    case Op::PredicatedLoadINTEL:
+    case Op::PredicatedStoreINTEL:
     {
       // these are kernel only
       RDCERR("Encountered unexpected kernel SPIR-V operation %s", ToStr(opdata.op).c_str());

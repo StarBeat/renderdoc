@@ -721,7 +721,8 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::RayTracingKHR:
       case Capability::RayTracingPositionFetchKHR:
       case Capability::RayTraversalPrimitiveCullingKHR:
-      case Capability::RayTracingOpacityMicromapEXT:
+      case Capability::RayTracingOpacityMicromapKHR:
+      case Capability::RayTracingOpacityMicromapExecutionModeKHR:
       {
         supported = false;
         break;
@@ -765,6 +766,49 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
         break;
       }
 
+      // SPV_EXT_shader_invocation_reorder
+      case Capability::ShaderInvocationReorderEXT:
+      {
+        supported = false;
+        break;
+      }
+
+      // SPV_EXT_shader_subgroup_partitioned
+      case Capability::GroupNonUniformPartitionedEXT:
+      {
+        supported = false;
+        break;
+      }
+
+      // SPV_EXT_long_vector
+      case Capability::LongVectorEXT:
+      {
+        supported = false;
+        break;
+      }
+
+      // SPV_EXT_descriptor_heap
+      case Capability::DescriptorHeapEXT:
+      {
+        supported = false;
+        break;
+      }
+
+      // SPV_KHR_constant_data & SPV_KHR_abort
+      case Capability::AbortKHR:
+      case Capability::ConstantDataKHR:
+      {
+        supported = false;
+        break;
+      }
+
+      // SPV_KHR_poison_freeze
+      case Capability::PoisonFreezeKHR:
+      {
+        supported = false;
+        break;
+      }
+
       // no plans to support these - mostly Kernel/OpenCL related or vendor extensions
       case Capability::Addresses:
       case Capability::Linkage:
@@ -792,7 +836,6 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::PerViewAttributesNV:
       case Capability::MeshShadingNV:
       case Capability::ImageFootprintNV:
-      case Capability::GroupNonUniformPartitionedNV:
       case Capability::CooperativeMatrixNV:
       case Capability::ShaderSMBuiltinsNV:
       case Capability::SubgroupShuffleINTEL:
@@ -834,7 +877,7 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::DebugInfoModuleINTEL:
       case Capability::BindlessTextureNV:
       case Capability::MemoryAccessAliasingINTEL:
-      case Capability::SplitBarrierINTEL:
+      case Capability::SplitBarrierEXT:
       case Capability::GroupUniformArithmeticKHR:
       case Capability::CoreBuiltinsARM:
       case Capability::FPGADSPControlALTERA:
@@ -899,6 +942,23 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::BindlessImagesINTEL:
       case Capability::RayTracingNV:
       case Capability::ShaderInvocationReorderNV:
+      case Capability::PushConstantBanksNV:
+      case Capability::MultipleWaitQueuesQCOM:
+      case Capability::Float6EXT:
+      case Capability::Float4EXT:
+      case Capability::Float8UnsignedE8M0EXT:
+      case Capability::MXInt8EXT:
+      case Capability::DotProductBFloat16AccVALVE:
+      case Capability::DotProductFloat16AccFloat16VALVE:
+      case Capability::DotProductFloat16AccFloat32VALVE:
+      case Capability::DotProductFloat8AccFloat32VALVE:
+      case Capability::WeakLinkageAMD:
+      case Capability::PredicatedIOINTEL:
+      case Capability::RoundedDivideSqrtINTEL:
+      case Capability::ImageGatherLinearQCOM:
+      case Capability::ImageGatherExtendedModesQCOM:
+      case Capability::CooperativeMatrixDecodeVectorNV:
+      case Capability::BitcastExtractEXT:
       case Capability::Max:
       case Capability::Invalid:
       {
@@ -932,6 +992,33 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
 
     debuggable = false;
     debugStatus += StringFormat::Fmt("Unsupported extended instruction set: '%s'\n", setname.c_str());
+  }
+
+  // we don't currently support debugging unbounded arrays of cbuffers
+  for(const Variable &v : globals)
+  {
+    if(v.storage == StorageClass::Uniform)
+    {
+      const DataType &type = dataTypes[v.type];
+
+      // global variables should all be pointers into opaque storage
+      RDCASSERT(type.type == DataType::PointerType);
+
+      const DataType *innertype = &dataTypes[type.InnerType()];
+
+      if(innertype->type == DataType::ArrayType)
+      {
+        if(innertype->length == Id())
+        {
+          debuggable = false;
+          rdcstr name = strings[v.id];
+          if(name.empty())
+            name = GetRawName(v.id);
+          debugStatus +=
+              StringFormat::Fmt("Unsupported unbounded uniform buffer array: '%s'\n", name.c_str());
+        }
+      }
+    }
   }
 
   debugStatus.trim();
@@ -1230,7 +1317,9 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
           if(curDecorations.flags & Decorations::HasBuiltIn)
             builtin = MakeShaderBuiltin(stage, curDecorations.builtIn);
 
-          this->apiWrapper->FillInputValue(var, builtin, laneIndex, (uint32_t)location, component);
+          // Only set inputs for active lanes
+          if(apiWrapper->GetThreadProperty(laneIndex, ThreadProperty::Active) != 0)
+            this->apiWrapper->FillInputValue(var, builtin, laneIndex, (uint32_t)location, component);
         }
         else
         {
@@ -2097,14 +2186,36 @@ void Debugger::FillCallstack(ThreadState &thread, ShaderDebugState &state) const
 
 void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) const
 {
-  for(InstructionSourceInfo &i : instInfo)
+  const ScopeData *prevScope = NULL;
+  size_t prevScopeNumMappings = 0;
+
+  for(size_t i = 0; i < instInfo.size(); i++)
   {
-    size_t offs = instructionOffsets[i.instruction];
+    InstructionSourceInfo &inst = instInfo[i];
+
+    size_t offs = instructionOffsets[inst.instruction];
 
     const ScopeData *scope = GetScope(offs);
 
     if(!scope)
+    {
+      prevScope = NULL;
       continue;
+    }
+
+    // if we're in the same scope as the last instruction
+    if(scope == prevScope)
+    {
+      // and no new mappings are available in this instruction compared to last time
+      if(prevScopeNumMappings < scope->localMappings.size() &&
+         scope->localMappings[prevScopeNumMappings].instIndex > inst.instruction)
+      {
+        // we will get the same result - just copy.
+        // i must be > 0 here because prevScope is NULL on i = 0
+        inst.sourceVars = instInfo[i - 1].sourceVars;
+        continue;
+      }
+    }
 
     // track which mappings we've processed, so if the same variable has mappings in multiple scopes
     // we only pick the innermost.
@@ -2123,6 +2234,8 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
       scope = scope->parent;
     }
 
+    prevScope = scope;
+
     // Iterate over the scopes downwards (parent->child)
     for(size_t s = 0; s < scopes.size(); ++s)
     {
@@ -2132,8 +2245,12 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
         const LocalMapping &mapping = scope->localMappings[m];
 
         // if this mapping is past the current instruction, stop here.
-        if(mapping.instIndex > i.instruction)
+        if(mapping.instIndex > inst.instruction)
+        {
+          if(s == scopes.size() - 1)
+            prevScopeNumMappings = m;
           break;
+        }
 
         // see if this mapping is superceded by a later mapping in this scope for this instruction.
         // This is a bit inefficient but simple. The alternative would be to do record
@@ -2145,7 +2262,7 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
           const LocalMapping &laterMapping = scope->localMappings[n];
 
           // if this mapping is past the current instruction, stop here.
-          if(laterMapping.instIndex > i.instruction)
+          if(laterMapping.instIndex > inst.instruction)
             break;
 
           // if this mapping will supercede and starts later
@@ -2389,7 +2506,8 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
                 usage->children.resize(rows);
                 for(uint32_t x = 0; x < rows; x++)
                 {
-                  rdcstr suffix = StringFormat::Fmt(".%s", typeWalk->structMembers[x].first.c_str());
+                  rdcstr suffix = typeWalk->structMembers[x].first;
+                  suffix.insert(0, '.');
                   usage->children[x].debugVar = usage->debugVar;
                   usage->children[x].debugVarSuffix = usage->debugVarSuffix + suffix;
                   usage->children[x].name = usage->name + suffix;
@@ -2722,17 +2840,18 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
           }
         }
       }
+      size_t baseSize = inst.sourceVars.size();
+      inst.sourceVars.resize(baseSize + sourceVarNodes.size());
       for(size_t x = 0; x < sourceVarNodes.size(); ++x)
       {
         const DebugVarNode *n = sourceVarNodes[x];
-        SourceVariableMapping sourceVar;
+        SourceVariableMapping &sourceVar = inst.sourceVars[baseSize + x];
         sourceVar.name = n->name;
         sourceVar.type = n->type;
         sourceVar.rows = n->rows;
         sourceVar.columns = n->columns;
         sourceVar.signatureIndex = -1;
         sourceVar.offset = n->offset;
-        sourceVar.variables.clear();
         // unknown is treated as a struct
         if(sourceVar.type == VarType::Unknown)
           sourceVar.type = VarType::Struct;
@@ -2741,34 +2860,38 @@ void Debugger::FillDebugSourceVars(rdcarray<InstructionSourceInfo> &instInfo) co
         {
           ConstIter it = GetID(n->debugVar);
 
+          rdcstr debugVarName = GetRawName(n->debugVar) + n->debugVarSuffix;
+
           if(it.opcode() == Op::Undef)
           {
             sourceVar.rows = sourceVar.columns = 1;
             sourceVar.undefinedValue = true;
 
-            sourceVar.variables.push_back(DebugVariableReference(
-                DebugVariableType::Variable, GetRawName(n->debugVar) + n->debugVarSuffix, 0));
+            sourceVar.variables.push_back(
+                DebugVariableReference(DebugVariableType::Variable, debugVarName, 0));
           }
           else
           {
             RDCASSERTNOTEQUAL(n->rows * n->columns, 0);
+            sourceVar.variables.resize(n->rows * n->columns);
             for(uint32_t c = 0; c < n->rows * n->columns; ++c)
             {
-              sourceVar.variables.push_back(DebugVariableReference(
-                  DebugVariableType::Variable, GetRawName(n->debugVar) + n->debugVarSuffix, c));
+              sourceVar.variables[c].type = DebugVariableType::Variable;
+              sourceVar.variables[c].name = debugVarName;
+              sourceVar.variables[c].component = c;
             }
           }
         }
         else
         {
           RDCASSERTEQUAL(n->rows * n->columns, (uint32_t)n->children.count());
+          sourceVar.variables.reserve(n->children.size());
           for(int32_t c = 0; c < n->children.count(); ++c)
             sourceVar.variables.push_back(DebugVariableReference(
                 DebugVariableType::Variable,
                 GetRawName(n->children[c].debugVar) + n->children[c].debugVarSuffix,
                 n->children[c].debugVarComponent));
         }
-        i.sourceVars.push_back(sourceVar);
       }
     }
   }
@@ -5324,6 +5447,7 @@ void Debugger::ProcessQueuedDeviceThreadSteps()
   }
 }
 
+// Can be called from any thread
 void Debugger::FillInputValue(ShaderVariable &var, ShaderBuiltin builtin, uint32_t threadIndex) const
 {
   apiWrapper->FillInputValue(var, builtin, threadIndex, 0, 0);

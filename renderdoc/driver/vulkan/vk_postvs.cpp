@@ -1109,12 +1109,12 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl, const SPIRV
           {
             if(action->flags & ActionFlags::Indexed)
             {
-              valueID = editor.AddConstantImmediate<uint32_t>(action->vertexOffset);
+              valueID = editor.AddConstantImmediate<int32_t>(action->baseVertex);
+              compType = CompType::SInt;
             }
             else
             {
-              valueID = editor.AddConstantImmediate<int32_t>(action->baseVertex);
-              compType = CompType::SInt;
+              valueID = editor.AddConstantImmediate<uint32_t>(action->vertexOffset);
             }
           }
           else if(builtin == ShaderBuiltin::BaseInstance)
@@ -1507,6 +1507,7 @@ struct OutMeshletLayout
 };
 
 static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
+                                const bool align,
                                 rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
                                 const rdcspv::DataType &type, rdcspv::Id &structType,
                                 uint32_t &byteSize);
@@ -1522,7 +1523,8 @@ static void LayOutStorageArray(rdcspv::Editor &editor, const rdcarray<SpecConsta
   // handle arrays-of-arrays and arrays-of-struts
   if(arrayInnerType.type == rdcspv::DataType::StructType)
   {
-    LayOutStorageStruct(editor, specInfo, outputTypeReplacements, arrayInnerType, innerId, size);
+    LayOutStorageStruct(editor, specInfo, false, outputTypeReplacements, arrayInnerType, innerId,
+                        size);
   }
   else if(arrayInnerType.type == rdcspv::DataType::ArrayType)
   {
@@ -1551,6 +1553,7 @@ static void LayOutStorageArray(rdcspv::Editor &editor, const rdcarray<SpecConsta
 }
 
 static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
+                                const bool align,
                                 rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
                                 const rdcspv::DataType &type, rdcspv::Id &structType,
                                 uint32_t &byteSize)
@@ -1577,12 +1580,11 @@ static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConst
 
     if(childType.type == rdcspv::DataType::StructType)
     {
-      offset = AlignUp16(offset);
-      LayOutStorageStruct(editor, specInfo, outputTypeReplacements, childType, memberTypeId, size);
+      LayOutStorageStruct(editor, specInfo, false, outputTypeReplacements, childType, memberTypeId,
+                          size);
     }
     else if(childType.type == rdcspv::DataType::ArrayType)
     {
-      offset = AlignUp16(offset);
       LayOutStorageArray(editor, specInfo, outputTypeReplacements, childType, memberTypeId, size);
     }
     else
@@ -1609,7 +1611,9 @@ static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConst
     editor.AddDecoration(rdcspv::OpMemberDecorate(
         structType, i, rdcspv::DecorationParam<rdcspv::Decoration::Offset>(offsets[i])));
 
-  byteSize = AlignUp16(offset);
+  if(align)
+    offset = AlignUp16(offset);
+  byteSize = offset;
 }
 
 static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
@@ -1676,7 +1680,7 @@ static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
 
         payloadBlockStructType = payloadTaskStructType = type.InnerType();
         rdcspv::SparseIdMap<rdcspv::Id> outputTypeReplacements;
-        LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+        LayOutStorageStruct(editor, specInfo, true, outputTypeReplacements,
                             editor.GetDataType(payloadBlockStructType), payloadBlockStructType,
                             payloadSize);
         break;
@@ -1693,6 +1697,7 @@ static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
   }
 
   rdcarray<rdcspv::Id> newGlobals;
+  rdcarray<rdcspv::Id> requiredBuiltInInputs;
 
   newGlobals.push_back(outSlotAddr);
 
@@ -1704,6 +1709,7 @@ static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
         ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
     if(newGlobal != rdcspv::Id())
       newGlobals.push_back(newGlobal);
+    requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::LocalInvocationIndex));
   }
 
   // calculate base address for our task group's data
@@ -1723,6 +1729,8 @@ static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
       if(newGlobal != rdcspv::Id())
         newGlobals.push_back(newGlobal);
 
+      requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::WorkgroupId));
+      requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::NumWorkgroups));
       // x + y * xsize + z * xsize * ysize
 
       rdcspv::Id xsize = locationCalculate.add(
@@ -1795,6 +1803,12 @@ static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
     editor.Remove(it);
 
     entry.iface.append(newGlobals);
+    for(rdcspv::Id id : requiredBuiltInInputs)
+    {
+      if(entry.iface.contains(id))
+        continue;
+      entry.iface.push_back(id);
+    }
 
     editor.AddOperation(it, entry);
   }
@@ -1905,6 +1919,7 @@ static void ConvertToFixedTaskFeeder(const rdcarray<SpecConstant> &specInfo,
   editor.SetName(baseAddrId, "baseAddr");
 
   rdcarray<rdcspv::Id> newGlobals;
+  rdcarray<rdcspv::Id> requiredBuiltInInputs;
 
   rdcspv::Id entryID;
 
@@ -1961,7 +1976,7 @@ static void ConvertToFixedTaskFeeder(const rdcarray<SpecConstant> &specInfo,
 
         uint32_t byteSize = 0;
         rdcspv::SparseIdMap<rdcspv::Id> outputTypeReplacements;
-        LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+        LayOutStorageStruct(editor, specInfo, true, outputTypeReplacements,
                             editor.GetDataType(payloadBlockStructType), payloadBlockStructType,
                             byteSize);
 
@@ -2032,6 +2047,9 @@ static void ConvertToFixedTaskFeeder(const rdcarray<SpecConstant> &specInfo,
         ops, ShaderStage::Mesh, rdcspv::BuiltIn::NumWorkgroups, uint3Type);
     if(newGlobal != rdcspv::Id())
       newGlobals.push_back(newGlobal);
+
+    requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::WorkgroupId));
+    requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::NumWorkgroups));
 
     // x + y * xsize + z * xsize * ysize
 
@@ -2160,6 +2178,12 @@ static void ConvertToFixedTaskFeeder(const rdcarray<SpecConstant> &specInfo,
     editor.Remove(it);
 
     entry.iface.append(newGlobals);
+    for(rdcspv::Id id : requiredBuiltInInputs)
+    {
+      if(entry.iface.contains(id))
+        continue;
+      entry.iface.push_back(id);
+    }
 
     editor.AddOperation(it, entry);
   }
@@ -2207,19 +2231,14 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
   editor.SetName(baseAddrId, "baseAddr");
 
   rdcarray<rdcspv::Id> newGlobals;
+  rdcarray<rdcspv::Id> requiredBuiltInInputs;
 
   newGlobals.push_back(outSlotAddr);
 
-  rdcspv::Id indextype;
   uint32_t indexCount = 3;
   for(const SigParameter &sig : refl.outputSignature)
-  {
     if(sig.systemValue == ShaderBuiltin::OutputIndices)
-    {
       indexCount = sig.compCount;
-      indextype = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<float>(), sig.compCount));
-    }
-  }
 
   rdcspv::Id entryID;
   rdcarray<rdcspv::Id> entryInterface;
@@ -2336,7 +2355,8 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
 
     if(type.type == rdcspv::DataType::StructType)
     {
-      LayOutStorageStruct(editor, specInfo, outputTypeReplacements, type, arrayInnerType, byteSize);
+      LayOutStorageStruct(editor, specInfo, true, outputTypeReplacements, type, arrayInnerType,
+                          byteSize);
 
       stride = byteSize;
 
@@ -2603,6 +2623,8 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
       if(newGlobal != rdcspv::Id())
         newGlobals.push_back(newGlobal);
 
+      requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::WorkgroupId));
+      requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::NumWorkgroups));
       // x + y * xsize + z * xsize * ysize
 
       rdcspv::Id xsize = locationCalculate.add(
@@ -2684,6 +2706,7 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
         ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
     if(newGlobal != rdcspv::Id())
       newGlobals.push_back(newGlobal);
+    requiredBuiltInInputs.push_back(editor.GetBuiltInVariable(rdcspv::BuiltIn::LocalInvocationIndex));
   }
 
   // add the globals we registered
@@ -2697,6 +2720,12 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
     editor.Remove(it);
 
     entry.iface.append(newGlobals);
+    for(rdcspv::Id id : requiredBuiltInInputs)
+    {
+      if(entry.iface.contains(id))
+        continue;
+      entry.iface.push_back(id);
+    }
 
     editor.AddOperation(it, entry);
   }

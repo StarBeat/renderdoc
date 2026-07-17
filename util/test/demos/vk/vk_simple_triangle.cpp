@@ -76,45 +76,8 @@ RD_TEST(VK_Simple_Triangle, VulkanGraphicsTest)
                              VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, 1, VK_SAMPLE_COUNT_4_BIT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
 
-    VkDebugUtilsObjectTagInfoEXT tag = {
-        VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_TAG_INFO_EXT,
-        NULL,
-        VK_OBJECT_TYPE_INSTANCE,
-        (uint64_t)instance,
-        RENDERDOC_APIObjectAnnotationHelper,
-        sizeof(instance),
-        instance,
-    };
-
-    vkSetDebugUtilsObjectTagEXT(device, &tag);
-    tag.objectHandle = (uint64_t)phys;
-    tag.objectType = VK_OBJECT_TYPE_PHYSICAL_DEVICE;
-    tag.pTag = phys;
-    vkSetDebugUtilsObjectTagEXT(device, &tag);
-
-    RENDERDOC_AnnotationValue val;
-
-    rdoc->SetObjectAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), instance,
-                              "someInstData", eRENDERDOC_Bool, 0, RDAnnotationHelper(true));
-    rdoc->SetObjectAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), phys, "physData",
-                              eRENDERDOC_String, 0, RDAnnotationHelper("my physical device ha ha"));
-
-    rdoc->SetObjectAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), offimg.image,
-                              "cool.secretInfo", eRENDERDOC_Float, 0, RDAnnotationHelper(3.14f));
-    val.apiObject = offimgMS.image;
-    rdoc->SetObjectAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), offimg.image,
-                              "cool.otherimage", eRENDERDOC_APIObject, 0, &val);
-
     while(Running())
     {
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), queue,
-                                 "global.coolQueue", eRENDERDOC_Bool, 0, RDAnnotationHelper(true));
-
-      int counter = 1;
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), queue,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
       VkCommandBuffer cmd = GetCommandBuffer();
 
       vkBeginCommandBuffer(cmd, vkh::CommandBufferBeginInfo());
@@ -122,26 +85,9 @@ RD_TEST(VK_Simple_Triangle, VulkanGraphicsTest)
       VkImage swapimg =
           StartUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.coolCommand", eRENDERDOC_Bool, 0, RDAnnotationHelper(true));
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "draw.isClear", eRENDERDOC_Bool, 0, RDAnnotationHelper(true));
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "draw.clearingswap", eRENDERDOC_Float, 0, RDAnnotationHelper(1.1f));
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "draw.notclearing", eRENDERDOC_APIObject, 0, &val);
-
       vkCmdClearColorImage(cmd, swapimg, VK_IMAGE_LAYOUT_GENERAL,
                            vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd, "draw",
-                                 eRENDERDOC_Empty, 0, NULL);
 
       vkh::cmdPipelineBarrier(
           cmd, {
@@ -149,17 +95,9 @@ RD_TEST(VK_Simple_Triangle, VulkanGraphicsTest)
                                            VK_IMAGE_LAYOUT_GENERAL, offimg.image),
                });
 
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
       vkCmdClearColorImage(cmd, offimg.image, VK_IMAGE_LAYOUT_GENERAL,
                            vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
 
       vkh::cmdPipelineBarrier(
           cmd, {
@@ -171,51 +109,19 @@ RD_TEST(VK_Simple_Triangle, VulkanGraphicsTest)
                            vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
 
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "renderpass.type", eRENDERDOC_String, 0,
-                                 RDAnnotationHelper("boring"));
-
       vkCmdBeginRenderPass(
           cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
           VK_SUBPASS_CONTENTS_INLINE);
 
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
       vkCmdSetViewport(cmd, 0, 1, &mainWindow->viewport);
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
       vkh::cmdBindVertexBuffers(cmd, 0, {vb.buffer}, {0});
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
       vkCmdDraw(cmd, 3, 1, 0, 0);
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
 
       vkCmdEndRenderPass(cmd);
 
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
-
       FinishUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
-
-      rdoc->SetCommandAnnotation(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), cmd,
-                                 "global.counter", eRENDERDOC_Int32, 0,
-                                 RDAnnotationHelper(counter++));
 
       vkEndCommandBuffer(cmd);
 

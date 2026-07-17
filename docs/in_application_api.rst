@@ -13,14 +13,14 @@ The recommended way to access the RenderDoc API is to passively check if the mod
 
 To do this you'll use your platforms dynamic library functions to see if the library is open already - e.g. ``GetModuleHandle`` on Windows, or ``dlopen`` with the ``RTLD_NOW | RTLD_NOLOAD`` flags if available on \*nix systems. On most platforms you can just search for the module name - ``renderdoc.dll`` on Windows, or ``librenderdoc.so`` on Linux, or ``libVkLayer_GLES_RenderDoc.so`` on Android should be sufficient here, so you don't need to know the path to where RenderDoc is running from. This will vary by platform however so consult your platform's OS documentation. Then you can use ``GetProcAddress`` or ``dlsym`` to fetch the ``RENDERDOC_GetAPI`` function using the typedef above.
 
+.. _renderdoc-api-example:
+
 .. cpp:function:: int RENDERDOC_GetAPI(RENDERDOC_Version version, void **outAPIPointers)
 
 
     This function is the only entry point actually exported from the RenderDoc module. You call this function with the desired API version, and pass it the address of a pointer to the appropriate struct type. If successful, RenderDoc will set the pointer to point to a struct containing the function pointers for the API functions (detailed below) and return 1.
 
     Note that version numbers follow `semantic versioning <http://semver.org>`_ which means the implementation returned may have a higher minor and/or patch version than requested.
-
-.. _renderdoc-api-example:
 
     Example code:
 
@@ -495,7 +495,7 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
 
     Added in API version 1.2.0
 
-.. cpp:function:: void SetObjectAnnotation(RENDERDOC_DevicePointer device, void* object, const char *key, RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth, const RENDERDOC_AnnotationValue* value)
+.. cpp:function:: uint32_t SetObjectAnnotation(RENDERDOC_DevicePointer device, void* object, const char *key, RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth, const RENDERDOC_AnnotationValue* value)
 
     This function allows associating custom rich annotations with API objects. These annotations can be examined in the :doc:`window/resource_inspector`.
     
@@ -581,7 +581,7 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
 
     ``eRENDERDOC_APIObject`` indicates that the ``apiObject`` member of ``RENDERDOC_AnnotationValue`` is valid.
  
-.. cpp:function:: void SetCommandAnnotation(RENDERDOC_DevicePointer device, void* queueOrCommandBuffer, const char* key, RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth, const RENDERDOC_AnnotationValue* value)
+.. cpp:function:: uint32_t SetCommandAnnotation(RENDERDOC_DevicePointer device, void* queueOrCommandBuffer, const char* key, RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth, const RENDERDOC_AnnotationValue* value)
 
     This function allows adding custom rich annotations to command streams. These annotations can be examined in the :doc:`window/annotation_viewer` which has more information on the annotation system.
 

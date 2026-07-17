@@ -53,10 +53,10 @@ RD_TEST(GL_Annotations, OpenGLGraphicsTest)
       rdoc->SetObjectAnnotation(d, img, "basic.bool", eRENDERDOC_Bool, 0, RDAnnotationHelper(true));
       rdoc->SetObjectAnnotation(d, img, "basic.int32", eRENDERDOC_Int32, 0, RDAnnotationHelper(-3));
       rdoc->SetObjectAnnotation(d, img, "basic.int64", eRENDERDOC_Int64, 0,
-                                RDAnnotationHelper(-3000000000000LL));
+                                RDAnnotationHelper((int64_t)-3000000000000LL));
       rdoc->SetObjectAnnotation(d, img, "basic.uint32", eRENDERDOC_UInt32, 0, RDAnnotationHelper(3));
       rdoc->SetObjectAnnotation(d, img, "basic.uint64", eRENDERDOC_UInt64, 0,
-                                RDAnnotationHelper(3000000000000LL));
+                                RDAnnotationHelper((uint64_t)3000000000000LL));
       rdoc->SetObjectAnnotation(d, img, "basic.float", eRENDERDOC_Float, 0,
                                 RDAnnotationHelper(3.25f));
       rdoc->SetObjectAnnotation(d, img, "basic.double", eRENDERDOC_Double, 0,

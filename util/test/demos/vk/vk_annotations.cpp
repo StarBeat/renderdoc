@@ -76,11 +76,11 @@ RD_TEST(VK_Annotations, VulkanGraphicsTest)
       rdoc->SetObjectAnnotation(d, img.image, "basic.int32", eRENDERDOC_Int32, 0,
                                 RDAnnotationHelper(-3));
       rdoc->SetObjectAnnotation(d, img.image, "basic.int64", eRENDERDOC_Int64, 0,
-                                RDAnnotationHelper(-3000000000000LL));
+                                RDAnnotationHelper((int64_t)-3000000000000LL));
       rdoc->SetObjectAnnotation(d, img.image, "basic.uint32", eRENDERDOC_UInt32, 0,
                                 RDAnnotationHelper(3));
       rdoc->SetObjectAnnotation(d, img.image, "basic.uint64", eRENDERDOC_UInt64, 0,
-                                RDAnnotationHelper(3000000000000LL));
+                                RDAnnotationHelper((uint64_t)3000000000000LL));
       rdoc->SetObjectAnnotation(d, img.image, "basic.float", eRENDERDOC_Float, 0,
                                 RDAnnotationHelper(3.25f));
       rdoc->SetObjectAnnotation(d, img.image, "basic.double", eRENDERDOC_Double, 0,

@@ -2561,6 +2561,10 @@ HRESULT WrappedID3D12Device::Present(ID3D12GraphicsCommandList *pOverlayCommandL
         rdcstr overlayText =
             RenderDoc::Inst().GetOverlayText(RDCDriver::D3D12, devWnd, m_FrameCounter, 0);
 
+        if(m_LastCaptureFailed > 0 && Timing::GetUnixTimestamp() - m_LastCaptureFailed < 5)
+          overlayText += StringFormat::Fmt("\nCapture failed: %s",
+                                           ResultDetails(m_LastCaptureError).Message().c_str());
+
         if(D3D12_Debug_RT_Overlay() && m_UsedRT)
         {
           ASStats blasStats = {}, tlasStats = {};
@@ -2757,9 +2761,16 @@ bool WrappedID3D12Device::Serialise_BeginCaptureFrame(SerialiserType &ser)
     for(uint32_t i = 0; i < numAnnotations; i++)
     {
       SERIALISE_ELEMENT_LOCAL(id, it->first);
-      SDObject *annotation = it->second;
+      SDObject *annotation = NULL;
       if(ser.IsReading())
+      {
         annotation = new SDObject(""_lit, ""_lit);    // will be overwritten below
+      }
+      else
+      {
+        annotation = it->second;
+        it++;
+      }
       ser.Serialise("annotation"_lit, *annotation);
 
       if(ser.IsReading() && IsLoading(m_State))
@@ -2767,8 +2778,6 @@ bool WrappedID3D12Device::Serialise_BeginCaptureFrame(SerialiserType &ser)
         m_Annotations[id] = annotation;
         m_Replay->GetResourceDesc(id).annotations = annotation;
       }
-
-      ++it;
     }
 
     if(numAnnotations > 0)
@@ -2814,6 +2823,8 @@ void WrappedID3D12Device::StartFrameCapture(DeviceOwnedWindow devWnd)
 {
   if(!IsBackgroundCapturing(m_State))
     return;
+
+  m_CaptureFailure = false;
 
   RDCLOG("Starting capture");
 
@@ -2930,6 +2941,14 @@ bool WrappedID3D12Device::EndFrameCapture(DeviceOwnedWindow devWnd)
 {
   if(!IsActiveCapturing(m_State))
     return true;
+
+  if(m_CaptureFailure)
+  {
+    m_LastCaptureFailed = Timing::GetUnixTimestamp();
+    return DiscardFrameCapture(devWnd);
+  }
+
+  m_CaptureFailure = false;
 
   IDXGISwapper *swapper = NULL;
   SwapPresentInfo swapInfo = {};
@@ -3247,8 +3266,18 @@ bool WrappedID3D12Device::EndFrameCapture(DeviceOwnedWindow devWnd)
     captureSectionSize = captureWriter->GetOffset();
   }
 
-  RDCLOG("Captured D3D12 frame with %f MB capture section in %f seconds",
-         double(captureSectionSize) / (1024.0 * 1024.0), m_CaptureTimer.GetMilliseconds() / 1000.0);
+  if(m_CaptureFailure)
+  {
+    m_LastCaptureFailed = Timing::GetUnixTimestamp();
+    SAFE_DELETE(rdc);
+  }
+  else
+  {
+    RDCLOG("Captured D3D12 frame with %f MB capture section in %f seconds",
+           double(captureSectionSize) / (1024.0 * 1024.0), m_CaptureTimer.GetMilliseconds() / 1000.0);
+  }
+
+  m_CaptureFailure = false;
 
   if(D3D12Core)
   {
@@ -3338,6 +3367,8 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   if(!IsActiveCapturing(m_State))
     return true;
 
+  m_CaptureFailure = false;
+
   RDCLOG("Discarding frame capture.");
 
   RenderDoc::Inst().FinishCaptureWriting(NULL, m_CapturedFrames.back().frameNumber);
@@ -3345,6 +3376,9 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   m_CapturedFrames.pop_back();
 
   rdcarray<WrappedID3D12CommandQueue *> queues;
+
+  rdcarray<WrappedID3D12CommandQueue *> refQueues;
+  rdcarray<ID3D12Resource *> refBuffers;
 
   // transition back to IDLE and readback initial states atomically
   {
@@ -3356,12 +3390,8 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 
     queues = m_Queues;
 
-    // remove the reference held during capture, potentially releasing the queue.
-    for(WrappedID3D12CommandQueue *q : m_RefQueues)
-      q->Release();
-
-    for(ID3D12Resource *r : m_RefBuffers)
-      r->Release();
+    refQueues.swap(m_RefQueues);
+    refBuffers.swap(m_RefBuffers);
   }
 
   rdcarray<MapState> maps = GetMaps();
@@ -3373,6 +3403,13 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 
   for(auto it = queues.begin(); it != queues.end(); ++it)
     (*it)->ClearAfterCapture();
+
+  // remove the references held during capture, potentially releasing the queue/buffer.
+  for(WrappedID3D12CommandQueue *q : refQueues)
+    q->Release();
+
+  for(ID3D12Resource *r : refBuffers)
+    r->Release();
 
   for(ID3D12Heap *h : m_InitialStateHeaps)
     h->Release();

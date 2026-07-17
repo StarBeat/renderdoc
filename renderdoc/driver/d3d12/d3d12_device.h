@@ -64,7 +64,7 @@ struct D3D12InitParams
   UINT SDKVersion = 0;
 
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x17;
+  static const uint64_t CurrentVersion = 0x20;
 
   static bool IsSupportedVersion(uint64_t ver);
 };
@@ -751,6 +751,10 @@ private:
   int m_OOMHandler = 0;
   RDResult m_FatalError = ResultCode::Succeeded;
 
+  bool m_CaptureFailure = false;
+  uint64_t m_LastCaptureFailed = 0;
+  RDResult m_LastCaptureError = ResultCode::Succeeded;
+
   uint64_t m_TimeBase = 0;
   double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile = NULL;
@@ -985,7 +989,18 @@ public:
   void CheckDeferredResult(const RDResult &res);
   void AddDeferredTime(double ms);
 
-  void ReportFatalError(RDResult error) { m_FatalError = error; }
+  void ReportFatalError(RDResult error)
+  {
+    if(IsCaptureMode(m_State))
+    {
+      m_CaptureFailure = true;
+      m_LastCaptureError = error;
+    }
+    else
+    {
+      m_FatalError = error;
+    }
+  }
   RDResult FatalErrorCheck() { return m_FatalError; }
   bool HasFatalError() { return m_FatalError != ResultCode::Succeeded; }
   ResourceDescription &GetResourceDesc(ResourceId id);

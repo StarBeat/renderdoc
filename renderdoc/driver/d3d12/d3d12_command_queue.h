@@ -173,11 +173,11 @@ class WrappedID3D12CommandQueue : public ID3D12CommandQueue1,
   CaptureState &m_State;
 
   // tracking ray dispatches that are pending during capture, to free them once the execution is finished
-  ID3D12Fence *m_RayFence = NULL;
+  ID3D12Fence *m_CallbackFence = NULL;
   UINT64 m_RayFenceValue = 1;
   rdcarray<PatchedRayDispatch::Resources> m_RayDispatchesPending;
 
-  ID3D12Fence *GetRayFence();
+  ID3D12Fence *GetCallbackFence();
 
   bool m_MarkedActive = false;
 

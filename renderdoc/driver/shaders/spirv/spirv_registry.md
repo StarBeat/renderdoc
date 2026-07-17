@@ -17,7 +17,7 @@ To publish a new extension, please create a pull request which includes:
 
 - The extension document in the asciidoc format named following
   the `SPV_<vendor>_<name>.asciidoc` pattern. The document should be placed
-  in the `extension/<vendor>` folder.
+  in the `extensions/<vendor>` folder.
 - README.md update with the link to the new extension once published
 
 To publish a non-semantic extended instruction set,
@@ -37,9 +37,11 @@ Note: we no longer push the HTML along side the extension.
 
 * [SPV_KHR_16bit_storage                   ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_16bit_storage.html)
 * [SPV_KHR_8bit_storage                    ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_8bit_storage.html)
+* [SPV_KHR_abort                           ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_abort.html)
 * [SPV_KHR_bfloat16                        ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_bfloat16.html)
 * [SPV_KHR_bit_instructions                ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_bit_instructions.html)
 * [SPV_KHR_compute_shader_derivatives      ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_compute_shader_derivatives.html)
+* [SPV_KHR_constant_data                   ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_constant_data.html)
 * [SPV_KHR_cooperative_matrix              ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_cooperative_matrix.html)
 * [SPV_KHR_device_group                    ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_device_group.html)
 * [SPV_KHR_expect_assume                   ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_expect_assume.html)
@@ -54,6 +56,8 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_KHR_multiview                       ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_multiview.html)
 * [SPV_KHR_no_integer_wrap_decoration      ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_no_integer_wrap_decoration.html)
 * [SPV_KHR_non_semantic_info               ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_non_semantic_info.html)
+* [SPV_KHR_opacity_micromap                ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_opacity_micromap.html)
+* [SPV_KHR_poison_freeze                   ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_poison_freeze.html)
 * [SPV_KHR_physical_storage_buffer         ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_physical_storage_buffer.html)
 * [SPV_KHR_post_depth_coverage             ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_post_depth_coverage.html)
 * [SPV_KHR_quad_control                    ]( https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_quad_control.html)
@@ -82,12 +86,15 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_EXT_arithmetic_fence                ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_arithmetic_fence.html)
 * [SPV_EXT_demote_to_helper_invocation     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_demote_to_helper_invocation.html)
 * [SPV_EXT_descriptor_indexing             ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_descriptor_indexing.html)
+* [SPV_EXT_descriptor_heap                 ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_descriptor_heap.html)
 * [SPV_EXT_float8                          ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_float8.html)
 * [SPV_EXT_fragment_fully_covered          ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_fragment_fully_covered.html)
 * [SPV_EXT_fragment_invocation_density     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_fragment_invocation_density.html)
 * [SPV_EXT_fragment_shader_interlock       ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_fragment_shader_interlock.html)
 * [SPV_EXT_image_raw10_raw12               ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_image_raw10_raw12.html)
+* [SPV_EXT_long_vector                     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_long_vector.html)
 * [SPV_EXT_mesh_shader                     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_mesh_shader.html)
+* [SPV_EXT_ocp_microscaling_types          ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_ocp_microscaling_types.html)
 * [SPV_EXT_opacity_micromap                ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_opacity_micromap.html)
 * [SPV_EXT_optnone                         ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_optnone.html)
 * [SPV_EXT_physical_storage_buffer         ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_physical_storage_buffer.html)
@@ -98,9 +105,12 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_EXT_shader_atomic_float_min_max     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_atomic_float_min_max.html)
 * [SPV_EXT_shader_atomic_float16_add       ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_atomic_float16_add.html)
 * [SPV_EXT_shader_image_int64              ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_image_int64.html)
+* [SPV_EXT_shader_invocation_reorder       ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_invocation_reorder.html)
 * [SPV_EXT_shader_stencil_export           ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_stencil_export.html)
+* [SPV_EXT_shader_subgroup_partitioned     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_subgroup_partitioned.html)
 * [SPV_EXT_shader_tile_image               ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_tile_image.html)
 * [SPV_EXT_shader_viewport_index_layer     ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_viewport_index_layer.html)
+* [SPV_EXT_split_barrier                   ]( https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_split_barrier.html)
 
 ### Vendor Extensions
 
@@ -135,6 +145,7 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_AMD_shader_image_load_store_lod     ]( https://github.khronos.org/SPIRV-Registry/extensions/AMD/SPV_AMD_shader_image_load_store_lod.html)
 * [SPV_AMD_shader_trinary_minmax           ]( https://github.khronos.org/SPIRV-Registry/extensions/AMD/SPV_AMD_shader_trinary_minmax.html)
 * [SPV_AMD_texture_gather_bias_lod         ]( https://github.khronos.org/SPIRV-Registry/extensions/AMD/SPV_AMD_texture_gather_bias_lod.html)
+* [SPV_AMD_weak_linkage                    ]( https://github.khronos.org/SPIRV-Registry/extensions/AMD/SPV_AMD_weak_linkage.html)
 * [SPV_AMDX_shader_enqueue                 ]( https://github.khronos.org/SPIRV-Registry/extensions/AMD/SPV_AMDX_shader_enqueue.html)
 * [SPV_ARM_cooperative_matrix_layouts      ]( https://github.khronos.org/SPIRV-Registry/extensions/ARM/SPV_ARM_cooperative_matrix_layouts.html)
 * [SPV_ARM_core_builtins                   ]( https://github.khronos.org/SPIRV-Registry/extensions/ARM/SPV_ARM_core_builtins.html)
@@ -158,6 +169,8 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_INTEL_masked_gather_scatter         ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_masked_gather_scatter.html)
 * [SPV_INTEL_maximum_registers             ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_maximum_registers.html)
 * [SPV_INTEL_media_block_io                ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_media_block_io.html)
+* [SPV_INTEL_predicated_io                 ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_predicated_io.html)
+* [SPV_INTEL_rounded_divide_sqrt           ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_rounded_divide_sqrt.html)
 * [SPV_INTEL_shader_integer_functions2     ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_shader_integer_functions2.html)
 * [SPV_INTEL_split_barrier                 ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_split_barrier.html)
 * [SPV_INTEL_subgroups                     ]( https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_subgroups.html)
@@ -172,12 +185,14 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_NV_compute_shader_derivatives       ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_compute_shader_derivatives.html)
 * [SPV_NV_cooperative_matrix               ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_cooperative_matrix.html)
 * [SPV_NV_cooperative_matrix2              ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_cooperative_matrix2.html)
+* [SPV_NV_cooperative_matrix_decode_vector ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_cooperative_matrix_decode_vector.html)
 * [SPV_NV_cooperative_vector               ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_cooperative_vector.html)
 * [SPV_NV_displacement_micromap            ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_displacement_micromap.html)
 * [SPV_NV_fragment_shader_barycentric      ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_fragment_shader_barycentric.html)
 * [SPV_NV_geometry_shader_passthrough      ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_geometry_shader_passthrough.html)
 * [SPV_NV_linear_swept_spheres             ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_linear_swept_spheres.html)
 * [SPV_NV_mesh_shader                      ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_mesh_shader.html)
+* [SPV_NV_push_constant_bank               ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_push_constant_bank.html)
 * [SPV_NV_raw_access_chains                ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_raw_access_chains.html)
 * [SPV_NV_ray_tracing                      ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_ray_tracing.html)
 * [SPV_NV_ray_tracing_motion_blur          ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_ray_tracing_motion_blur.html)
@@ -191,19 +206,24 @@ Note: we no longer push the HTML along side the extension.
 * [SPV_NV_stereo_view_rendering            ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_stereo_view_rendering.html)
 * [SPV_NV_tensor_addressing                ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_tensor_addressing.html)
 * [SPV_NV_viewport_array2                  ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NV_viewport_array2.html)
-* [SPV_NVX_multiview_per_view_attributes   ]( https://github.khronos.org/SPIRV-Registry/extensions/NV/SPV_NVX_multiview_per_view_attributes.html)
+* [SPV_NVX_multiview_per_view_attributes   ]( https://github.khronos.org/SPIRV-Registry/extensions/NVX/SPV_NVX_multiview_per_view_attributes.html)
 * [SPV_QCOM_cooperative_matrix_conversion  ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_cooperative_matrix_conversion.html)
 * [SPV_QCOM_image_processing               ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_image_processing.html)
 * [SPV_QCOM_image_processing2              ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_image_processing2.html)
+* [SPV_QCOM_image_processing3              ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_image_processing3.html)
+* [SPV_QCOM_multiple_wait_queues           ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_multiple_wait_queues.html)
 * [SPV_QCOM_tile_shading                   ]( https://github.khronos.org/SPIRV-Registry/extensions/QCOM/SPV_QCOM_tile_shading.html)
+* [SPV_VALVE_mixed_float_dot_product       ]( https://github.khronos.org/SPIRV-Registry/extensions/VALVE/SPV_VALVE_mixed_float_dot_product.html)
 
 ## Non-Semantic Extended Instruction Set Specifications
 
 * [NonSemantic.ClspvReflection             ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.ClspvReflection.html)
 * [NonSemantic.DebugBreak                  ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.DebugBreak.html)
 * [NonSemantic.DebugPrintf                 ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.DebugPrintf.html)
-* [NonSemantic.Shader.DebugInfo.100        ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.Shader.DebugInfo.100.html)
+* [NonSemantic.Graph.DebugInfo             ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.Graph.DebugInfo.html)
+* [NonSemantic.Shader.DebugInfo            ]( https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.Shader.DebugInfo.html)
 
 ## Extended Instruction Set Specifications
 
+* [Arm.ExperimentalMLOperations            ]( https://github.khronos.org/SPIRV-Registry/extended/Arm.ExperimentalMLOperations.html)
 * [TOSA.001000.1                           ]( https://github.khronos.org/SPIRV-Registry/extended/TOSA.001000.1.html)
