@@ -376,8 +376,8 @@ struct LogLine
     // F/libc    (11519): Fatal signal 11 (SIGSEGV), code 1, fault addr 0x4 in tid 11618 (FooBar), pid 11519 (blah)
     // F/DEBUG   (12061): backtrace:
     // F/DEBUG   (12061):     #00 pc 000485ec  /system/lib/libc.so (pthread_mutex_lock+1)
-    // F/DEBUG   (12061):     #01 pc 00137449  /data/app/org.renderdoc.renderdoccmd.arm32==/lib/arm/libVkLayer_GLES_RenderDoc.so
-    // F/DEBUG   (12061):     #02 pc 0013bbf1  /data/app/org.renderdoc.renderdoccmd.arm32==/lib/arm/libVkLayer_GLES_RenderDoc.so
+    // F/DEBUG   (12061):     #01 pc 00137449  /data/app/org.renderdoc.renderdoccmd.arm32==/lib/arm/libEGLV3.so
+    // F/DEBUG   (12061):     #02 pc 0013bbf1  /data/app/org.renderdoc.renderdoccmd.arm32==/lib/arm/libEGLV3.so
     //
     // clang-format on
     //

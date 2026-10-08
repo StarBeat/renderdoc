@@ -9,7 +9,7 @@ public class Loader extends android.app.NativeActivity
 {
     /* load our native library */
     static {
-        System.loadLibrary("renderdoccmd"); // this will load VkLayer_GLES_RenderDoc as well
+        System.loadLibrary("renderdoccmd"); // this will load libEGLV3 as well
     }
 
     @Override
