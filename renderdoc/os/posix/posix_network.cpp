@@ -409,7 +409,10 @@ Socket *CreateAbstractServerSocket(uint16_t port, int queuesize)
     return NULL;
   }
 
-  rdcstr socketName = StringFormat::Fmt("renderdoc_%d", port);
+  // note: the name is deliberately innocuous so that an application snooping on
+  // /proc/net/unix doesn't see an obvious 'renderdoc' marker. The android client
+  // scans for this same pattern, so keep the two in sync.
+  rdcstr socketName = StringFormat::Fmt("sock_%d", port);
 
   sockaddr_un addr;
   RDCEraseEl(addr);

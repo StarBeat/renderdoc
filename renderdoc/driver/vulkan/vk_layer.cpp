@@ -68,13 +68,13 @@ void KeepLayerAlive()
   // we create our own instance, which increases the refcount on the layer, then leak it to prevent
   // the layer being unloaded.
   RDCLOG("Creating internal instance to bump layer refcount");
-  void *module = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-  if(!module)
-    module = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+  // no dlopen here: the vulkan loader has already loaded us as a layer, so if it is present its
+  // exports are in the global namespace. explicit dlopens of libvulkan are an extra hazard in
+  // anti-cheat processes (see EndHookRegistration in android_hook.cpp).
+  PFN_vkCreateInstance create = (PFN_vkCreateInstance)dlsym(RTLD_DEFAULT, "vkCreateInstance");
 
-  if(module)
+  if(create)
   {
-    PFN_vkCreateInstance create = (PFN_vkCreateInstance)dlsym(module, "vkCreateInstance");
     VkApplicationInfo app = {
         VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL,
         "RenderDoc forced instance",        VK_MAKE_VERSION(1, 0, 0),
@@ -90,7 +90,7 @@ void KeepLayerAlive()
   }
   else
   {
-    RDCERR("Couldn't load libvulkan - can't force layer to stay alive");
+    RDCERR("libvulkan not loaded - can't force layer to stay alive");
   }
 }
 #else

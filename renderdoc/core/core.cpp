@@ -41,6 +41,14 @@
 #include "superluminal/superluminal.h"
 #include "crash_handler.h"
 
+#if ENABLED(RDOC_ANDROID)
+#include <sys/system_properties.h>
+namespace FileIO
+{
+rdcstr GetTempRootPath();
+}
+#endif
+
 #include "api/replay/renderdoc_tostr.inl"
 
 #include "api/replay/pipestate.inl"
@@ -696,6 +704,49 @@ void RenderDoc::Initialise()
 
     if(m_CaptureFileTemplate.empty())
       SetCaptureFileTemplate(capture_filename);
+
+#if ENABLED(RDOC_ANDROID)
+    // stealth: the default log path on android (/sdcard/.../RenderDoc/RenderDoc_app_*.log) is
+    // visible to the application through /proc/self/fd, which is a giveaway. Redirect the log
+    // into the app's private data directory, or disable file logging entirely with
+    // 'setprop debug.rdoc.NO_FILE_LOG 1' (logcat still receives everything).
+    {
+      char noFileLog[PROP_VALUE_MAX] = {0};
+      __system_property_get("debug.rdoc.NO_FILE_LOG", noFileLog);
+
+      if(noFileLog[0] == '1')
+      {
+        RDCLOG("File logging disabled via debug.rdoc.NO_FILE_LOG - logging to logcat only");
+        m_LoggingFilename = "";
+      }
+      else
+      {
+        rdcstr package;
+        FileIO::GetExecutableFilename(package);
+        // the default log path on android is either GetTempRootPath()+"/RenderDoc/..." (which
+        // points at /sdcard/Android/media/<pkg>/files) or /data/data/<pkg>/files/... - both
+        // are app-facing giveaways (visible via /proc/self/fd), so redirect to the private data
+        // dir with the RenderDoc subdirectory and filename prefix stripped.
+        const rdcstr tempRoot = FileIO::GetTempRootPath();
+        const rdcstr dataDir = "/data/data/" + package + "/files";
+
+        rdcstr targetDir;
+        if(strncmp(m_LoggingFilename.c_str(), tempRoot.c_str(), tempRoot.size()) == 0)
+          targetDir = dataDir;
+        else if(strncmp(m_LoggingFilename.c_str(), dataDir.c_str(), dataDir.size()) == 0)
+          targetDir = dataDir;
+
+        if(!targetDir.empty())
+        {
+          rdcstr filename = get_basename(m_LoggingFilename);
+          if(filename.beginsWith("RenderDoc_"))
+            filename = filename.substr(strlen("RenderDoc_"));
+          m_LoggingFilename = targetDir + "/" + filename;
+          FileIO::CreateParentDirectory(m_LoggingFilename);
+        }
+      }
+    }
+#endif
 
     RDCLOGFILE(m_LoggingFilename.c_str());
   }

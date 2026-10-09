@@ -48,6 +48,7 @@
 #include "os/os_specific.h"
 
 #include <inttypes.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -314,6 +315,134 @@ void HideLibraryFromMaps()
 #endif
 }
 
+struct LinkMapDisguiseData
+{
+  const char *innocentName = NULL;
+  char *ourName = NULL;        // points at the string behind dlpi_name
+  ElfW(Addr) ourBase = 0;
+  const ElfW(Phdr) *ourPhdr = NULL;
+  ElfW(Half) ourPhnum = 0;
+};
+
+static int LinkMapDisguiseCollect(struct dl_phdr_info *info, size_t size, void *data)
+{
+  LinkMapDisguiseData *ctx = (LinkMapDisguiseData *)data;
+
+  // remember the first non-empty innocuous soname as the fake identity, and capture our own
+  // entry's data.
+  if(info->dlpi_name && strstr(info->dlpi_name, RENDERDOC_ANDROID_LIBRARY))
+  {
+    ctx->ourName = (char *)info->dlpi_name;
+    ctx->ourBase = info->dlpi_addr;
+    ctx->ourPhdr = info->dlpi_phdr;
+    ctx->ourPhnum = info->dlpi_phnum;
+  }
+  else if(!ctx->innocentName && info->dlpi_name && info->dlpi_name[0])
+  {
+    ctx->innocentName = info->dlpi_name;
+  }
+
+  return 0;
+}
+
+static int LinkMapDisguiseVerify(struct dl_phdr_info *info, size_t size, void *data)
+{
+  if(info->dlpi_name && strstr(info->dlpi_name, RENDERDOC_ANDROID_LIBRARY))
+    *(bool *)data = true;
+
+  return 0;
+}
+
+// Overwrite the bytes at 'dest' (up to destLen) with 'fake', null-terminated. Used only for
+// strings in our own memory (our DT_SONAME in our dynstr), which may be read-only.
+static void OverwriteNameString(char *dest, size_t destLen, const char *fake)
+{
+  size_t fakeLen = strlen(fake);
+  if(fakeLen >= destLen)
+    return;
+
+  size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+  uintptr_t pageStart = (uintptr_t)dest & ~(pagesize - 1);
+  size_t pageSpan = ((uintptr_t)dest + destLen - pageStart + pagesize - 1) & ~(pagesize - 1);
+
+  if(mprotect((void *)pageStart, pageSpan, PROT_READ | PROT_WRITE) != 0)
+    return;
+
+  memset(dest, 0, destLen);
+  memcpy(dest, fake, fakeLen);
+}
+
+// Disguise our identity in the linker's link_map views by rewriting our DT_SONAME string in
+// our own dynstr. bionic's r_debug.r_map (the gdb view) reports l_name from this string, so
+// r_map walkers see the fake name. If dl_iterate_phdr reports dlpi_name from the same string
+// the disguise covers it too; on bionic versions where dlpi_name is a separate realpath
+// string we leave that one alone - it lives inside the linker's protected small-object
+// allocator arena and writing it corrupts the linker (observed: SIGSEGV in
+// BionicSmallObjectAllocator::alloc on the next dlopen).
+//
+// We keep our entry itself - unlinking it would stop the unwinder (LLVM libunwind in the
+// linker) from finding our .eh_frame and crash any exception that unwinds through our frames.
+static void DisguiseLinkMapEntry()
+{
+  LinkMapDisguiseData data;
+
+  dl_iterate_phdr(LinkMapDisguiseCollect, &data);
+
+  if(!data.ourBase || !data.ourPhdr)
+  {
+    RDCLOG("Couldn't find our link_map entry to disguise");
+    return;
+  }
+
+  // the fake name must fit inside our DT_SONAME string.
+  const char *fake = data.innocentName;
+  if(!fake || strlen(fake) >= strlen(RENDERDOC_ANDROID_LIBRARY))
+    fake = "libc.so";
+
+  // overwrite our DT_SONAME string in our own dynstr
+  for(ElfW(Half) ph = 0; ph < data.ourPhnum; ph++)
+  {
+    if(data.ourPhdr[ph].p_type != PT_DYNAMIC)
+      continue;
+
+    ElfW(Dyn) *dynamic = (ElfW(Dyn) *)(data.ourBase + data.ourPhdr[ph].p_vaddr);
+
+    const char *strtab = NULL;
+    size_t strtabcount = 0;
+    size_t sonameOffset = 0;
+
+    while(dynamic->d_tag != DT_NULL)
+    {
+      if(dynamic->d_tag == DT_STRTAB)
+        strtab = (const char *)(data.ourBase + dynamic->d_un.d_ptr);
+      else if(dynamic->d_tag == DT_STRSZ)
+        strtabcount = dynamic->d_un.d_val;
+      else if(dynamic->d_tag == DT_SONAME)
+        sonameOffset = dynamic->d_un.d_val;
+
+      dynamic++;
+    }
+
+    if(strtab && sonameOffset && sonameOffset < strtabcount)
+    {
+      // only overwrite the soname string itself - the rest of the string table must stay
+      // intact for symbol lookups.
+      char *sonameStr = (char *)(strtab + sonameOffset);
+      OverwriteNameString(sonameStr, strlen(sonameStr), fake);
+    }
+
+    break;
+  }
+
+  bool stillVisible = false;
+  dl_iterate_phdr(LinkMapDisguiseVerify, &stillVisible);
+
+  if(stillVisible)
+    RDCLOG("Disguised our DT_SONAME as '%s' (dl_iterate_phdr still shows our realpath)", fake);
+  else
+    RDCLOG("Disguised our link_map name as '%s'", fake);
+}
+
 // Run the hide during the library constructor - i.e. while the dynamic linker is still
 // loading us and no other thread can be executing our code (concurrent dlopens are
 // serialised by the linker). Hiding later is racy: the app's render thread may already
@@ -322,4 +451,5 @@ void HideLibraryFromMaps()
 __attribute__((constructor)) static void InitLibraryHide()
 {
   HideLibraryFromMaps();
+  DisguiseLinkMapEntry();
 }

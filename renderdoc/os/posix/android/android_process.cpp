@@ -64,7 +64,7 @@ int GetIdentPort(pid_t childPid)
       fgets(line, sz - 1, f);
 
       int port = 0;
-      char *startpos = strstr(line, "@renderdoc_");
+      char *startpos = strstr(line, "@sock_");
 
       if(startpos == NULL)
       {
@@ -72,9 +72,9 @@ int GetIdentPort(pid_t childPid)
         continue;
       }
 
-      int num = sscanf(startpos, "@renderdoc_%d", &port);
+      int num = sscanf(startpos, "@sock_%d", &port);
 
-      // find open listen abstract socket on 'renderdoc_<port>'
+      // find open listen abstract socket on 'sock_<port>'
       if(num == 1 && port >= RenderDoc_FirstTargetControlPort &&
          port <= RenderDoc_LastTargetControlPort)
       {
@@ -88,11 +88,10 @@ int GetIdentPort(pid_t childPid)
 
   if(ret == 0)
   {
-    RDCWARN(
-        "Couldn't locate renderdoc target control listening port between @renderdoc_%u and "
-        "@renderdoc_%u in %s",
-        (uint32_t)RenderDoc_FirstTargetControlPort, (uint32_t)RenderDoc_LastTargetControlPort,
-        procfile.c_str());
+    RDCWARN("Couldn't locate renderdoc target control listening port between @sock_%u and "
+            "@sock_%u in %s",
+            (uint32_t)RenderDoc_FirstTargetControlPort, (uint32_t)RenderDoc_LastTargetControlPort,
+            procfile.c_str());
   }
 
   return ret;

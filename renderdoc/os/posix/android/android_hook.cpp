@@ -27,6 +27,9 @@
 #include "hooks/hooks.h"
 #include "plthook/plthook.h"
 
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
 #include <android/dlext.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -52,21 +55,25 @@
 // from plthook_elf.c
 #if defined __x86_64__ || defined __x86_64
 #define R_JUMP_SLOT R_X86_64_JUMP_SLOT
+#define R_GLOB_DAT R_X86_64_GLOB_DAT
 #define Elf_Rel ElfW(Rela)
 #define ELF_R_TYPE ELF64_R_TYPE
 #define ELF_R_SYM ELF64_R_SYM
 #elif defined __i386__ || defined __i386
 #define R_JUMP_SLOT R_386_JMP_SLOT
+#define R_GLOB_DAT R_386_GLOB_DAT
 #define Elf_Rel ElfW(Rel)
 #define ELF_R_TYPE ELF32_R_TYPE
 #define ELF_R_SYM ELF32_R_SYM
 #elif defined __arm__ || defined __arm
 #define R_JUMP_SLOT R_ARM_JUMP_SLOT
+#define R_GLOB_DAT R_ARM_GLOB_DAT
 #define Elf_Rel ElfW(Rel)
 #define ELF_R_TYPE ELF32_R_TYPE
 #define ELF_R_SYM ELF32_R_SYM
 #elif defined __aarch64__ || defined __aarch64 /* ARM64 */
 #define R_JUMP_SLOT R_AARCH64_JUMP_SLOT
+#define R_GLOB_DAT R_AARCH64_GLOB_DAT
 #define Elf_Rel ElfW(Rela)
 #define ELF_R_TYPE ELF64_R_TYPE
 #define ELF_R_SYM ELF64_R_SYM
@@ -260,6 +267,8 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
     size_t strtabcount = 0;
     Elf_Rel *pltbase = NULL;
     ElfW(Sword) pltcount = 0;
+    Elf_Rel *relbase = NULL;
+    size_t relcount = 0;
 
     while(dynamic->d_tag != DT_NULL)
     {
@@ -273,6 +282,10 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
         pltbase = (Elf_Rel *)(info->dlpi_addr + dynamic->d_un.d_ptr);
       else if(dynamic->d_tag == DT_PLTRELSZ)
         pltcount = dynamic->d_un.d_val / sizeof(Elf_Rel);
+      else if(dynamic->d_tag == DT_RELA || dynamic->d_tag == DT_REL)
+        relbase = (Elf_Rel *)(info->dlpi_addr + dynamic->d_un.d_ptr);
+      else if(dynamic->d_tag == DT_RELASZ || dynamic->d_tag == DT_RELSZ)
+        relcount = dynamic->d_un.d_val / sizeof(Elf_Rel);
 
       /*
       if(dynamic->d_tag == DT_NEEDED)
@@ -414,6 +427,50 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
         HOOK_DEBUG_PRINT("[%i*] %s at %p (ptr to %p)", i, importname, import, *import);
       }
     }
+
+    // GLOB_DAT relocations: imports that have no PLT entry (the importing code took the
+    // symbol's address, or the linker coalesced the call) are resolved straight into the GOT.
+    // Patch those too, otherwise an app that links against the loader and stores the
+    // enumeration entry point's address would bypass the filter.
+    for(size_t i = 0; i < relcount; i++)
+    {
+      Elf_Rel *rel = relbase + i;
+      if(ELF_R_TYPE(rel->r_info) != R_GLOB_DAT)
+        continue;
+
+      size_t idx = ELF_R_SYM(rel->r_info);
+      size_t name = dynsym[idx].st_name;
+      if(name + 1 > strtabcount)
+        continue;
+
+      const char *importname = strtab + name;
+      void **import = (void **)(info->dlpi_addr + rel->r_offset);
+
+      const FunctionHook repl = GetHookInfo().GetFunctionHook(importname);
+      if(repl.hook)
+      {
+        HOOK_DEBUG_PRINT("replacing GLOB_DAT %s!", importname);
+
+        uintptr_t pagebase = 0;
+
+        if(relro_failed || (relro_base <= import && import <= relro_end))
+        {
+          pagebase = uintptr_t(import) & ~(pagesize - 1);
+
+          int ret = mprotect((void *)pagebase, pagesize, PROT_READ | PROT_WRITE);
+          if(ret != 0)
+          {
+            RDCERR("Couldn't read/write the page: %d %d", ret, errno);
+            return 0;
+          }
+        }
+
+        *import = repl.hook;
+
+        if(pagebase && !relro_failed)
+          mprotect((void *)pagebase, pagesize, PROT_READ);
+      }
+    }
   }
 
   return 0;
@@ -444,6 +501,12 @@ void process_dlopen(const char *filename, int flag)
   }
 }
 
+// stealth: real entry points of the vulkan loader, resolved lazily (see RegisterStealthHooks
+// below for why there is no dlopen here).
+static PFN_vkEnumerateInstanceLayerProperties Real_vkEnumerateInstanceLayerProperties = NULL;
+static PFN_vkGetInstanceProcAddr Real_vkGetInstanceProcAddr = NULL;
+static void RegisterStealthHooks();
+
 extern "C" __attribute__((visibility("default"))) void *hooked_dlopen(const char *filename, int flag)
 {
   // get caller address immediately.
@@ -460,7 +523,14 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlopen(const char
   HOOK_DEBUG_PRINT("Got %p", ret);
 
   if(filename && ret)
+  {
+    // the vulkan loader wasn't loaded when our hooks were registered - if it is being loaded
+    // now, register the enumeration-filtering hooks before we patch the new library's PLT.
+    if(strstr(filename, "libvulkan") && !Real_vkGetInstanceProcAddr)
+      RegisterStealthHooks();
+
     process_dlopen(filename, flag);
+  }
 
   return ret;
 }
@@ -484,7 +554,12 @@ extern "C" __attribute__((visibility("default"))) void *hooked_android_dlopen_ex
   HOOK_DEBUG_PRINT("Got %p", ret);
 
   if(__filename && ret)
+  {
+    if(strstr(__filename, "libvulkan") && !Real_vkGetInstanceProcAddr)
+      RegisterStealthHooks();
+
     process_dlopen(__filename, __flags);
+  }
 
   return ret;
 }
@@ -519,6 +594,17 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
   Dl_info info = {};
   dladdr(ret, &info);
   HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
+
+  // stealth: if the app resolves the vulkan loader's enumeration entry points via dlsym
+  // (bypassing the PLT hooks), give it the filtered versions so our layer name stays hidden.
+  if(info.dli_fname && strstr(info.dli_fname, "libvulkan") &&
+     (!strcmp(symbol, "vkEnumerateInstanceLayerProperties") ||
+      !strcmp(symbol, "vkGetInstanceProcAddr")))
+  {
+    HOOK_DEBUG_PRINT("returning filtered %s for dlsym in %s", symbol, info.dli_fname);
+    return repl.hook;
+  }
+
   return ret;
 }
 
@@ -531,6 +617,27 @@ static void InstallHooksCommon()
   GetHookInfo().SetHooked("libc.so");
   GetHookInfo().SetHooked("libvndksupport.so");
 
+  // our link_map name may have been disguised by the hide constructor (the name string is
+  // rewritten in place). Blacklist whatever name we currently present under, otherwise the
+  // PLT hooking pass would treat our own library as a foreign one and patch its imports.
+  {
+    Dl_info selfInfo = {};
+    if(dladdr((const void *)&InstallHooksCommon, &selfInfo) && selfInfo.dli_fbase)
+    {
+      auto findOurName = [](struct dl_phdr_info *info, size_t size, void *data) -> int {
+        if((void *)info->dlpi_addr == ((Dl_info *)data)->dli_fbase && info->dlpi_name &&
+           info->dlpi_name[0])
+        {
+          GetHookInfo().SetHooked(info->dlpi_name);
+          HOOK_DEBUG_PRINT("Blacklisted our disguised link_map name %s", info->dlpi_name);
+          return 1;
+        }
+        return 0;
+      };
+      dl_iterate_phdr(findOurName, &selfInfo);
+    }
+  }
+
   real_android_dlopen_ext = &android_dlopen_ext;
 
   loader_dlopen = (pfn__loader_dlopen)dlsym(RTLD_NEXT, "__loader_dlopen");
@@ -542,8 +649,11 @@ static void InstallHooksCommon()
   else
   {
     RDCWARN("Couldn't find __loader_dlopen, falling back to slow path for dlopen hooking");
-    LibraryHooks::RegisterFunctionHook("", FunctionHook("dlsym", NULL, (void *)&hooked_dlsym));
   }
+
+  // always hook dlsym: apps resolve loader entry points through dlsym as well as through
+  // vkGetInstanceProcAddr, and the stealth vulkan enumeration filter relies on intercepting both
+  LibraryHooks::RegisterFunctionHook("", FunctionHook("dlsym", NULL, (void *)&hooked_dlsym));
 
   LibraryHooks::RegisterFunctionHook(
       "", FunctionHook("android_dlopen_ext", NULL, (void *)&hooked_android_dlopen_ext));
@@ -726,10 +836,116 @@ void LibraryHooks::IgnoreLibrary(const char *libraryName)
 {
 }
 
+// ==== stealth: hide the Vulkan layer from application-facing enumeration ====
+//
+// The layer is activated by the loader through the android debug-layer settings, so the
+// application never needs to see 'VK_LAYER_RENDERDOC_Capture' in vkEnumerateInstanceLayerProperties.
+// These hooks sit at the application->loader boundary: the loader's own discovery of us goes
+// through its internal (direct) calls and is unaffected, but every app-facing enumeration is
+// filtered. We deliberately do NOT register libvulkan as a *library* hook - that would make
+// every dlopen("libvulkan.so") return our own library and break the loader chain.
+
+static VkResult VKAPI_PTR Filtered_vkEnumerateInstanceLayerProperties(
+    uint32_t *pPropertyCount, VkLayerProperties *pProperties)
+{
+  if(!Real_vkEnumerateInstanceLayerProperties)
+    Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)dlsym(
+        RTLD_DEFAULT, "vkEnumerateInstanceLayerProperties");
+
+  if(!Real_vkEnumerateInstanceLayerProperties || !pPropertyCount)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  // fetch the full list from the real loader
+  uint32_t fullCount = 0;
+  VkResult vkr = Real_vkEnumerateInstanceLayerProperties(&fullCount, NULL);
+  if(vkr != VK_SUCCESS)
+    return vkr;
+
+  rdcarray<VkLayerProperties> layers;
+  layers.resize(fullCount);
+
+  vkr = Real_vkEnumerateInstanceLayerProperties(&fullCount, layers.data());
+  if(vkr != VK_SUCCESS)
+    return vkr;
+
+  // filter out our own layer
+  rdcarray<VkLayerProperties> filtered;
+  for(const VkLayerProperties &layer : layers)
+    if(strcmp(layer.layerName, RENDERDOC_VULKAN_LAYER_NAME) != 0)
+      filtered.push_back(layer);
+
+  const uint32_t filteredCount = (uint32_t)filtered.size();
+
+  if(!pProperties)
+  {
+    *pPropertyCount = filteredCount;
+    return VK_SUCCESS;
+  }
+
+  const uint32_t requested = *pPropertyCount;
+  const uint32_t written = RDCMIN(requested, filteredCount);
+
+  if(written > 0)
+    memcpy(pProperties, filtered.data(), written * sizeof(VkLayerProperties));
+
+  *pPropertyCount = written;
+
+  return (filteredCount > requested) ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+static PFN_vkVoidFunction VKAPI_PTR Filtered_vkGetInstanceProcAddr(VkInstance instance,
+                                                                   const char *pName)
+{
+  if(instance == VK_NULL_HANDLE && pName)
+  {
+    if(!strcmp(pName, "vkEnumerateInstanceLayerProperties"))
+      return (PFN_vkVoidFunction)&Filtered_vkEnumerateInstanceLayerProperties;
+  }
+
+  if(!Real_vkGetInstanceProcAddr)
+    Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
+
+  if(!Real_vkGetInstanceProcAddr)
+    return NULL;
+
+  return Real_vkGetInstanceProcAddr(instance, pName);
+}
+
+static void RegisterStealthHooks()
+{
+  // the function hooks must be registered unconditionally, even when the vulkan loader isn't
+  // loaded yet: registering them keeps EndHookRegistration from taking the "no hooks" early-out,
+  // so our dlopen machinery gets installed and the loader's PLT is patched as soon as it is
+  // loaded. The real entry points are only resolved once the loader is present.
+  static bool registered = false;
+  if(!registered)
+  {
+    RDCLOG("Registering stealth hooks to hide " RENDERDOC_VULKAN_LAYER_NAME " from enumeration");
+
+    LibraryHooks::RegisterFunctionHook(
+        "libvulkan.so", FunctionHook("vkEnumerateInstanceLayerProperties", NULL,
+                                     (void *)&Filtered_vkEnumerateInstanceLayerProperties));
+    LibraryHooks::RegisterFunctionHook("libvulkan.so", FunctionHook("vkGetInstanceProcAddr", NULL,
+                                                                    (void *)&Filtered_vkGetInstanceProcAddr));
+    registered = true;
+  }
+
+  if(Real_vkGetInstanceProcAddr)
+    return;
+
+  // resolve the real entry points with dlsym only - the vulkan loader must already be loaded
+  // for this to work, so no dlopen (an explicit dlopen of libvulkan at init time is an extra
+  // hazard in anti-cheat processes; see the note in EndHookRegistration). If it isn't loaded
+  // yet this is retried from hooked_dlopen when a libvulkan library is loaded.
+  Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)dlsym(
+      RTLD_DEFAULT, "vkEnumerateInstanceLayerProperties");
+  Real_vkGetInstanceProcAddr =
+      (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
+}
+
 void LibraryHooks::EndHookRegistration()
 {
   HOOK_DEBUG_PRINT("EndHookRegistration");
-
   // ensure we load all libraries we can immediately, so they are immediately hooked and don't get
   // loaded later.
   rdcarray<rdcstr> libs = GetHookInfo().GetLibHooks();
@@ -739,28 +955,19 @@ void LibraryHooks::EndHookRegistration()
     HOOK_DEBUG_PRINT("%s: %p", lib.c_str(), handle);
   }
 
-  // try to prevent the library from being unloaded, increment our dlopen refcount (might not work
-  // on android, but we'll try!)
-  // we use RTLD_NOLOAD to prevent a second copy being loaded if this path doesn't refer to
-  // ourselves or otherwise breaks because of android's terrible library handling.
-  {
-    rdcstr selfLib;
-    FileIO::GetLibraryFilename(selfLib);
-    if(FileIO::exists(selfLib))
-    {
-      void *handle = dlopen(selfLib.c_str(), RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
-      if(handle)
-        RDCLOG("Dummy-loaded %s with dlopen to prevent library unload", selfLib.c_str());
-      else
-        RDCLOG("Failed to dummy-loaded %s with dlopen", selfLib.c_str());
-    }
-    else
-    {
-      RDCLOG("Couldn't dummy-load %s because it doesn't exist", selfLib.c_str());
-    }
-  }
+  // note: we deliberately do NOT dummy-load ourselves here with dlopen(RTLD_NOLOAD) to bump
+  // our refcount. On this target (a MiUI 12 game process with an active anti-cheat) that
+  // RTLD_NOLOAD dlopen reliably crashes inside the dynamic linker (SIGSEGV in
+  // BionicSmallObjectAllocator::alloc on the string-building path of do_dlopen), even with our
+  // hiding and name-disguise fully disabled - the environment has made that path unsafe. The
+  // loaders that activate us (GLES layer / Vulkan layer) hold their own references anyway, so
+  // skipping the refcount bump is safe.
 
-  if(libs.empty())
+  // hide our vulkan layer from application-facing enumeration. This runs even when we take the
+  // layered path below, where no other hooks are registered.
+  RegisterStealthHooks();
+
+  if(libs.empty() && GetHookInfo().GetFunctionHooks().empty())
   {
     RDCLOG("No library hooks registered, not doing any hooking");
     return;

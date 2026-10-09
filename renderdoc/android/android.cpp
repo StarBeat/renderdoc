@@ -47,7 +47,7 @@ namespace Android
 void adbForwardPorts(uint16_t portbase, const rdcstr &deviceID, uint16_t jdwpPort, int pid,
                      bool silent)
 {
-  const char *forwardCommand = "forward tcp:%i localabstract:renderdoc_%i";
+  const char *forwardCommand = "forward tcp:%i localabstract:sock_%i";
 
   adbExecCommand(deviceID,
                  StringFormat::Fmt(forwardCommand, portbase + RenderDoc_ForwardRemoteServerOffset,
