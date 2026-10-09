@@ -298,6 +298,7 @@ if(ANDROID)
         os/posix/android/android_process.cpp
         os/posix/android/android_threading.cpp
         os/posix/android/android_hook.cpp
+        os/posix/android/android_hide.cpp
         os/posix/android/android_network.cpp
         os/posix/posix_network.h
         os/posix/posix_network.cpp

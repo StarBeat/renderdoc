@@ -61,6 +61,12 @@ bool GetKeyState(int key)
 
 namespace FileIO
 {
+// cached copy of our own library path. The hide mechanism re-maps our library as anonymous
+// memory (so it no longer appears in /proc/self/maps) after initialisation, so we must resolve
+// the path once up-front and return the cached value afterwards - otherwise we'd fall back to
+// dladdr and spam warnings on every call.
+static rdcstr librenderdoc_cached_path;
+
 rdcstr GetTempRootPath()
 {
   // Save captures in the app's private /sdcard directory, which doesnt require
@@ -116,6 +122,15 @@ int LibraryLocator = 42;
 
 void GetLibraryFilename(rdcstr &selfName)
 {
+  // if we have already resolved the library path, return it. After the hide mechanism runs we
+  // are no longer visible in /proc/self/maps, so only the first call (before hiding) does the
+  // actual scan below.
+  if(!librenderdoc_cached_path.empty())
+  {
+    selfName = librenderdoc_cached_path;
+    return;
+  }
+
   // this is a hack, but the only reliable way to find the absolute path to the library.
   // dladdr would be fine but it returns the wrong result for symbols in the library
 
@@ -209,6 +224,8 @@ void GetLibraryFilename(rdcstr &selfName)
     if(dladdr(&LibraryLocator, &info))
       librenderdoc_path = info.dli_fname;
   }
+
+  librenderdoc_cached_path = librenderdoc_path;
 
   selfName = librenderdoc_path;
 }
