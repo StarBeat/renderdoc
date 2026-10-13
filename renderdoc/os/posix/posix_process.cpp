@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -681,7 +682,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 }
 
 uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
-                                bool internal, ProcessResult *result)
+                                bool internal, ProcessResult *result, uint32_t timeoutMS)
 {
   if(app.empty())
   {
@@ -706,27 +707,88 @@ uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, con
   {
     result->strStdout = "";
     result->strStderror = "";
+    result->timedOut = false;
 
     if(ret)
     {
-      ssize_t stdoutRead, stderrRead;
+      bool timedOut = false;
+      const uint64_t startTime = Timing::GetTick();
       char chBuf[4096];
-      do
-      {
-        stdoutRead = read(stdoutPipe[0], chBuf, sizeof(chBuf));
-        if(stdoutRead > 0)
-          result->strStdout += rdcstr(chBuf, stdoutRead);
-      } while(stdoutRead > 0);
 
-      do
-      {
-        stderrRead = read(stderrPipe[0], chBuf, sizeof(chBuf));
-        if(stderrRead > 0)
-          result->strStderror += rdcstr(chBuf, stderrRead);
+      // Timing::GetTick() returns raw ticks (nanoseconds on posix), not milliseconds - the
+      // frequency is ticks-per-millisecond, so divide it out to get an elapsed time in ms.
+      auto elapsedMS = [&startTime]() -> uint32_t {
+        return (uint32_t)((Timing::GetTick() - startTime) / Timing::GetTickFrequency());
+      };
 
-      } while(stderrRead > 0);
+      // read both pipes with a deadline instead of blocking on read() forever - a wedged child
+      // (adb is the usual culprit) would otherwise block the calling thread indefinitely.
+      struct pollfd fds[2] = {{stdoutPipe[0], POLLIN, 0}, {stderrPipe[0], POLLIN, 0}};
+
+      while(fds[0].fd >= 0 || fds[1].fd >= 0)
+      {
+        int waitMS = -1;
+        if(timeoutMS > 0)
+        {
+          const uint32_t elapsed = elapsedMS();
+          if(elapsed >= timeoutMS)
+          {
+            timedOut = true;
+            break;
+          }
+          waitMS = (int)(timeoutMS - elapsed);
+        }
+
+        const int r = poll(fds, 2, waitMS);
+
+        if(r < 0)
+        {
+          if(errno == EINTR)
+            continue;
+          break;
+        }
+        if(r == 0)
+        {
+          timedOut = true;
+          break;
+        }
+
+        for(int i = 0; i < 2; i++)
+        {
+          if(fds[i].fd < 0 || fds[i].revents == 0)
+            continue;
+
+          const ssize_t readBytes = read(fds[i].fd, chBuf, sizeof(chBuf));
+
+          if(readBytes > 0)
+          {
+            if(i == 0)
+              result->strStdout += rdcstr(chBuf, readBytes);
+            else
+              result->strStderror += rdcstr(chBuf, readBytes);
+          }
+          else if(readBytes < 0 && (errno == EINTR || errno == EAGAIN))
+          {
+            // spurious wakeup, try again
+          }
+          else
+          {
+            // EOF or error - this pipe is done
+            fds[i].fd = -1;
+          }
+        }
+      }
 
       result->retCode = 1;
+
+      if(timedOut)
+      {
+        RDCWARN("Process '%s' didn't finish within %u ms - killing it", app.c_str(), timeoutMS);
+        kill(ret, SIGKILL);
+        result->timedOut = true;
+        result->retCode = -1;
+      }
+
       pid_t p;
       int status;
       while((p = waitpid(ret, &status, WUNTRACED | WCONTINUED)) < 0 && errno == EINTR)
@@ -736,9 +798,9 @@ uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, con
 
       if(p < 0)
         RDCLOG("Failed to wait on pid %u, error: %d", ret, p, errno);
-      else if(WIFEXITED(status))
+      else if(!timedOut && WIFEXITED(status))
         result->retCode = WEXITSTATUS(status);
-      else
+      else if(!timedOut)
         RDCWARN("Process did not exit normally");
     }
 
@@ -751,12 +813,13 @@ uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, con
 }
 
 uint32_t Process::LaunchScript(const rdcstr &script, const rdcstr &workingDir,
-                               const rdcstr &argList, bool internal, ProcessResult *result)
+                               const rdcstr &argList, bool internal, ProcessResult *result,
+                               uint32_t timeoutMS)
 {
   // Change parameters to invoke command interpreter
   rdcstr args = "-lc \"" + script + " " + argList + "\"";
 
-  return LaunchProcess("bash", workingDir, args, internal, result);
+  return LaunchProcess("bash", workingDir, args, internal, result, timeoutMS);
 }
 
 void GetHookingEnvMods(rdcarray<EnvironmentModification> &modifications, const CaptureOptions &opts,

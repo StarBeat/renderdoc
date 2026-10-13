@@ -34,8 +34,11 @@ rdcstr GetPackageName(const rdcstr &packageAndActivity);
 rdcstr GetActivityName(const rdcstr &packageAndActivity);
 void ResetCaptureSettings(const rdcstr &deviceID);
 void ExtractDeviceIDAndIndex(const rdcstr &hostname, int &index, rdcstr &deviceID);
+// timeoutMS of 0 uses the default Android.AdbTimeoutMS. Long-running operations such as
+// installing or uninstalling a large APK should pass a much larger value so they aren't killed.
 Process::ProcessResult adbExecCommand(const rdcstr &deviceID, const rdcstr &args,
-                                      const rdcstr &workDir = ".", bool silent = false);
+                                      const rdcstr &workDir = ".", bool silent = false,
+                                      uint32_t timeoutMS = 0);
 void initAdb();
 void shutdownAdb();
 bool InjectWithJDWP(const rdcstr &deviceID, uint16_t jdwpport);

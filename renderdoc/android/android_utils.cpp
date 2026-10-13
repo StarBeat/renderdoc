@@ -252,8 +252,11 @@ rdcstr GetFriendlyName(const rdcstr &deviceID)
   // slow-ish.
   //
   // We do this here so that we sneakily take advantage of the above caching - otherwise we spam adb
-  // root commands into the log
-  Android::adbExecCommand(deviceID, "root");
+  // root commands into the log. It's cached per device (see adbRootOnce), so at most one 'root'
+  // command is issued for each device in a session - and the result is persisted, so later
+  // sessions don't re-issue it either. This only actually runs 'adb root' when there's no valid
+  // cached result, so the getprop calls below only ever follow a fresh root in that rare case.
+  adbRootOnce(deviceID);
 
   rdcstr manuf =
       Android::adbExecCommand(deviceID, "shell getprop ro.product.manufacturer").strStdout.trimmed();
@@ -281,12 +284,41 @@ bool HasRootAccess(const rdcstr &deviceID)
   // Try switching adb to root and check a few indicators for success
   // Nothing will fall over if we get a false positive here, it just enables
   // additional methods of getting things set up.
+  // The 'root' command itself is cached (see adbRootOnce) so it isn't re-issued on every
+  // enumeration or launch - it restarts adbd, which is slow and disruptive.
+  bool rootExecuted = false;
+  Process::ProcessResult result = adbRootOnce(deviceID, &rootExecuted);
 
-  Process::ProcessResult result = adbExecCommand(deviceID, "root");
+  // If 'adb root' was just issued here, adbd is restarting (or wedged on a device that can't be
+  // rooted). Don't run more shell commands into it on this pass - they'd sit in the restarting
+  // daemon and burn their timeouts. The next check sees the settled state.
+  if(rootExecuted)
+    return false;
 
   rdcstr whoami = adbExecCommand(deviceID, "shell whoami").strStdout.trimmed();
   if(whoami == "root")
     return true;
+
+  // If a cached result said we had root but the device isn't root any more, it has rebooted or
+  // been unrooted since the result was stored. Drop the cached result so the next check re-issues
+  // 'adb root' - but don't re-run it here, adbd may just have restarted and the device will be
+  // re-checked shortly anyway.
+  //
+  // Only a definitive non-root answer can contradict the cache: an empty whoami means the command
+  // failed and tells us nothing, and invalidating then would just re-issue 'adb root' for nothing.
+  //
+  // The cached result must also actually claim to have granted root before it can be contradicted.
+  // On production builds 'adb root' exits 0 with "adbd cannot run as root in production builds" -
+  // that is a confirmed failure, not an ambiguous success. Treating it as stale would erase the
+  // cache and re-issue 'adb root' on every session, and each re-issue restarts adbd and wedges the
+  // connection - the exact failure this cache was added to prevent.
+  const rdcstr &rootOut = result.strStdout;
+  const bool cachedResultClaimsRoot =
+      rootOut.contains("restarting adbd as root") || rootOut.contains("already running as root");
+
+  if(!whoami.empty() && result.retCode == 0 && !result.timedOut &&
+     adbRootResultCached(deviceID) && cachedResultClaimsRoot)
+    adbRootCacheInvalidate(deviceID);
 
   rdcstr checksu =
       adbExecCommand(deviceID, "shell test -e /system/xbin/su && echo found").strStdout.trimmed();

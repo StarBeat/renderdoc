@@ -72,11 +72,17 @@ struct ProcessResult
 {
   rdcstr strStdout, strStderror;
   int retCode;
+  // set when the process had to be killed because it exceeded the timeout passed to
+  // LaunchProcess, so callers can tell a timeout apart from an ordinary failure
+  bool timedOut = false;
 };
+// timeoutMS of 0 means wait forever (previous behaviour). When a timeout is given the child is
+// terminated if it hasn't finished in time - adb in particular can wedge indefinitely, e.g. when
+// a device serial is offline, which would otherwise block the calling thread forever.
 uint32_t LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
-                       bool internal, ProcessResult *result = NULL);
+                       bool internal, ProcessResult *result = NULL, uint32_t timeoutMS = 0);
 uint32_t LaunchScript(const rdcstr &script, const rdcstr &workingDir, const rdcstr &args,
-                      bool internal, ProcessResult *result = NULL);
+                      bool internal, ProcessResult *result = NULL, uint32_t timeoutMS = 0);
 rdcpair<RDResult, uint32_t> LaunchAndInjectIntoProcess(const rdcstr &app, const rdcstr &workingDir,
                                                        const rdcstr &cmdLine,
                                                        const rdcarray<EnvironmentModification> &env,

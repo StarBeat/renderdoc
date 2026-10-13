@@ -35,8 +35,11 @@
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QShortcut>
+#include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
+#include <atomic>
+#include <memory>
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/Extended/RDLabel.h"
@@ -57,6 +60,12 @@
 
 #define JSON_ID "rdocLayoutData"
 #define JSON_VER 1
+
+// How long the UI will stay disabled waiting for a background remote host check before putting
+// itself back in a usable state. The check itself is already bounded (adb commands time out via
+// Android.AdbTimeoutMS and remote sockets via RemoteServer.TimeoutMS) - this is a safety net for
+// a check that never returns at all, so the context chooser can't stay locked forever.
+static const uint32_t kRemoteCheckTimeoutMS = 60000;
 
 #if defined(Q_OS_WIN32)
 extern "C" void *__stdcall GetModuleHandleA(const char *);
@@ -2065,7 +2074,17 @@ void MainWindow::setRemoteHost(int hostIdx)
 
     statusText->setText(tr("Checking remote server status..."));
 
-    LambdaThread *th = new LambdaThread([this, h = host]() {
+    // shared with the watchdog below so exactly one of them restores the UI/token
+    auto checkFinished = std::make_shared<std::atomic<bool>>(false);
+
+    LambdaThread *th = new LambdaThread([this, h = host, checkFinished]() {
+      // make sure the watchdog is disarmed however this lambda exits
+      struct FinishGuard
+      {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~FinishGuard() { flag->store(true); }
+      } finishGuard{checkFinished};
+
       // make a mutable copy and see if the server is up
       RemoteHost host = h;
       host.CheckStatus();
@@ -2197,6 +2216,20 @@ void MainWindow::setRemoteHost(int hostIdx)
     th->setName(lit("Remote host check"));
     th->selfDelete(true);
     th->start();
+
+    // if the check never comes back (wedged adb, half-open connection) don't leave the context
+    // chooser disabled and the status bar spinning forever.
+    QTimer::singleShot(kRemoteCheckTimeoutMS, this, [this, checkFinished]() {
+      if(checkFinished->load())
+        return;
+
+      qWarning() << "Checking the remote server status is taking too long - restoring the UI";
+      contextChooser->setEnabled(true);
+      statusText->setText(tr("Timed out checking remote server status"));
+
+      if(m_Ctx.HasCaptureDialog())
+        m_Ctx.GetCaptureDialog()->UpdateRemoteHost();
+    });
   }
 }
 

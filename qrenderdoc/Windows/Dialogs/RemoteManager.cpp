@@ -24,12 +24,20 @@
 
 #include "RemoteManager.h"
 #include <QKeyEvent>
+#include <QTimer>
+#include <atomic>
+#include <memory>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/Resources.h"
 #include "Windows/Dialogs/LiveCapture.h"
 #include "Windows/MainWindow.h"
 #include "flowlayout/FlowLayout.h"
 #include "ui_RemoteManager.h"
+
+// How long a single host lookup may take before the dialog gives up on it and takes the lookup
+// token back. Individual operations are bounded (Android.AdbTimeoutMS for adb, RemoteServer
+// timeouts for sockets), so this is only a safety net against a lookup that never returns.
+static const uint32_t kLookupTimeoutMS = 30000;
 
 struct RemoteConnect
 {
@@ -220,14 +228,22 @@ void RemoteManager::refreshHost(RDTreeWidgetItem *node)
 
   m_Lookups.release();
 
+  // Shared with the timeout guard below so exactly one of them takes back the lookup token.
+  // Without that, a lookup thread that never returns leaves "N lookups remaining" and the refresh
+  // buttons disabled forever - which is what makes this dialog look like it is stuck updating.
+  auto finished = std::make_shared<std::atomic<bool>>(false);
+
   // this function looks up the remote connections and for each one open
   // queries it for the API, target (usually executable name) and if any user is already connected
-  LambdaThread *th = new LambdaThread([this, node, h = host]() {
+  LambdaThread *th = new LambdaThread([this, node, h = host, finished]() {
     QByteArray username = GetSystemUsername().toUtf8();
 
     // make a mutable copy and check the status
     RemoteHost host = h;
     host.CheckStatus();
+
+    if(finished->load())
+      return;
 
     GUIInvoke::call(this, [this, node, host]() {
       setRemoteServerLive(node, host.IsServerRunning(), host.IsBusy());
@@ -237,6 +253,10 @@ void RemoteManager::refreshHost(RDTreeWidgetItem *node)
 
     for(;;)
     {
+      // stop enumerating if the timeout guard already gave up on us
+      if(finished->load())
+        return;
+
       // just a sanity check to make sure we don't hit some unexpected case and infinite loop
       uint32_t prevIdent = nextIdent;
 
@@ -276,13 +296,32 @@ void RemoteManager::refreshHost(RDTreeWidgetItem *node)
 
     GUIInvoke::call(this, [node]() { node->setItalic(false); });
 
-    GUIInvoke::call(this, [this]() {
+    GUIInvoke::call(this, [this, finished]() {
+      // if the timeout guard already took the token, don't take it a second time
+      if(finished->exchange(true))
+        return;
+
       m_Lookups.acquire();
       updateStatus();
     });
   });
   th->selfDelete(true);
   th->start();
+
+  // guard against a lookup that never finishes (wedged adb, stale serial, half-open connection):
+  // take back the lookup token and mark the host as unavailable rather than sitting on
+  // "%1 lookups remaining" with the refresh buttons disabled forever.
+  QTimer::singleShot(kLookupTimeoutMS, this, [this, node, finished]() {
+    if(finished->exchange(true))
+      return;
+
+    qWarning() << "Timed out waiting for a remote host lookup to finish";
+    m_Lookups.acquire();
+    setRemoteServerLive(node, false, false);
+    node->setText(1, tr("Lookup timed out"));
+    node->setItalic(false);
+    updateStatus();
+  });
 }
 
 // don't allow the user to refresh until all pending connections have been checked

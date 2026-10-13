@@ -39,6 +39,10 @@ RDOC_CONFIG(uint32_t, Android_MaxConnectTimeout, 30,
             "Maximum time in seconds to try connecting to the target app before giving up. "
             "Useful primarily for apps that take a very long time to start up.");
 
+// Installing or removing a large APK legitimately takes far longer than the default adb timeout,
+// so those commands get a much bigger bound rather than being killed mid-transfer.
+static const uint32_t kAdbLongCommandTimeoutMS = 10 * 60 * 1000;
+
 RDOC_CONFIG(bool, Android_Debug_ProcessLaunch, false,
             "Output verbose debug logging messages when launching android apps.");
 
@@ -348,11 +352,13 @@ Process::ProcessResult InstallAPK(const rdcstr &deviceID, const rdcstr &apk, int
   Process::ProcessResult adbInstall;
   if(apiVersion >= 30)
   {
-    adbInstall = adbExecCommand(deviceID, "install -r -g --force-queryable \"" + apk + "\"");
+    adbInstall = adbExecCommand(deviceID, "install -r -g --force-queryable \"" + apk + "\"", ".",
+                                false, kAdbLongCommandTimeoutMS);
   }
   else
   {
-    adbInstall = adbExecCommand(deviceID, "install -r -g \"" + apk + "\"");
+    adbInstall =
+        adbExecCommand(deviceID, "install -r -g \"" + apk + "\"", ".", false, kAdbLongCommandTimeoutMS);
   }
 
   return adbInstall;
@@ -533,7 +539,7 @@ RDResult InstallRenderDocServer(const rdcstr &deviceID)
       RDCLOG("Failed to install APK. stdout: %s, stderr: %s",
              adbInstall.strStdout.trimmed().c_str(), adbInstall.strStderror.trimmed().c_str());
       RDCLOG("Retrying...");
-      adbExecCommand(deviceID, "install -r \"" + apk + "\"");
+      adbExecCommand(deviceID, "install -r \"" + apk + "\"", ".", false, kAdbLongCommandTimeoutMS);
 
       versionCheck = CheckAndroidServerVersion(deviceID, abi);
 
@@ -612,13 +618,14 @@ bool RemoveRenderDocAndroidServer(const rdcstr &deviceID)
     return false;
 
   // remove the old package, if it's still there. Ignore any errors
-  adbExecCommand(deviceID, "uninstall " RENDERDOC_ANDROID_PACKAGE_BASE);
+  adbExecCommand(deviceID, "uninstall " RENDERDOC_ANDROID_PACKAGE_BASE, ".", false,
+                 kAdbLongCommandTimeoutMS);
 
   for(ABI abi : abis)
   {
     rdcstr packageName = GetRenderDocPackageForABI(abi);
 
-    adbExecCommand(deviceID, "uninstall " + packageName);
+    adbExecCommand(deviceID, "uninstall " + packageName, ".", false, kAdbLongCommandTimeoutMS);
 
     // Ensure uninstall succeeded
     rdcstr adbCheck = ListPackages(deviceID, packageName).strStdout;
@@ -1057,6 +1064,13 @@ struct AndroidController : public IDeviceProtocolHandler
       // process the list of active devices, find matches and activate them, or add a new entry
       for(const rdcstr &d : activedevices)
       {
+        // A device whose adb channel has wedged is treated as not present: otherwise every
+        // enumeration cycle repeats the same timing-out commands and the device keeps reappearing
+        // in the UI with an empty name. It comes back once the cooldown expires and a command
+        // succeeds (or after a replug). See Android_AdbFailFastThreshold.
+        if(Android::adbChannelUnusable(d))
+          continue;
+
         auto it = devices.find(d);
         if(it != devices.end())
         {
@@ -1622,6 +1636,19 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
     result = RDResult(ResultCode::InjectionFailed, "Timeout was reached waiting for app to start.");
 
     uint32_t elapsed = 0, timeout = 1000 * RDCMAX(5U, Android_MaxConnectTimeout());
+
+    // Some ROMs accept the gpu_debug_* settings writes but silently ignore them - the verification
+    // above only proves the settings stuck, not that the GPU drivers honour them (ColorOS is one
+    // such ROM). The interceptor then never loads and no target control connection will ever
+    // appear. If we launched via native layering and nothing has connected within a short grace
+    // period, restart the app under a JDWP debugger and inject the library with Runtime.load()
+    // instead - that path doesn't depend on the ROM's layer support at all, only on the app being
+    // debuggable.
+    const uint32_t nativeLayerGraceMS = 1000 * RDCMIN(10U, RDCMAX(5U, Android_MaxConnectTimeout()));
+
+    // if the original launch already used JDWP injection, there's nothing to fall back to
+    bool jdwpFallbackAttempted = (jdwpPort != 0);
+
     while(elapsed < timeout)
     {
       // Check if the target app has started yet and we can connect to it.
@@ -1646,6 +1673,64 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
             result, ResultCode::InjectionFailed,
             "APK has crashed or never opened target control connection before closing.");
         break;
+      }
+
+      if(!jdwpFallbackAttempted && elapsed >= nativeLayerGraceMS)
+      {
+        jdwpFallbackAttempted = true;
+
+        if(Android::IsDebuggable(m_deviceID, packageName))
+        {
+          RDCLOG(
+              "No connection from native GPU layering within %u ms - the ROM may be ignoring the "
+              "debug layer settings. Restarting '%s' with JDWP injection.",
+              nativeLayerGraceMS, packageName.c_str());
+
+          uint16_t jdwpFallbackPort = Android::GetJdwpPort();
+
+          Android::adbExecCommand(m_deviceID, "shell am force-stop " + processName);
+
+          // start the activity with debugging enabled
+          Android::adbExecCommand(
+              m_deviceID, StringFormat::Fmt("shell am start -S -D -n %s/%s %s", packageName.c_str(),
+                                            activityName.c_str(), intentArgs.c_str()));
+
+          // sleep a little to let the activity start
+          Threading::Sleep(500);
+
+          curpid = Android::GetCurrentPID(m_deviceID, processName);
+
+          if(curpid == 0)
+          {
+            SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                             "APK failed to restart for JDWP injection.");
+            break;
+          }
+
+          Android::adbForwardPorts(m_portbase, m_deviceID, jdwpFallbackPort, curpid, false);
+
+          // sleep a little to let the ports initialise
+          Threading::Sleep(500);
+
+          bool injected = Android::InjectWithJDWP(m_deviceID, jdwpFallbackPort);
+
+          if(!injected)
+          {
+            result = RDResult(ResultCode::JDWPFailure);
+            result.message = StringFormat::Fmt(
+                "Failed to inject using JDWP when retrying '%s' with activity '%s'",
+                packageName.c_str(), activityName.c_str());
+            break;
+          }
+
+          RDCLOG("JDWP injection succeeded, waiting for the target control connection.");
+        }
+        else
+        {
+          RDCLOG("No connection from native GPU layering and '%s' is not debuggable - can't retry "
+                 "with JDWP injection.",
+                 packageName.c_str());
+        }
       }
 
       Threading::Sleep(1000);

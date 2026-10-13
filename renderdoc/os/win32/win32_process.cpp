@@ -1040,7 +1040,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 }
 
 uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
-                                bool internal, ProcessResult *result)
+                                bool internal, ProcessResult *result, uint32_t timeoutMS)
 {
   HANDLE hChildStdOutput_Rd = NULL, hChildStdError_Rd = NULL;
 
@@ -1078,36 +1078,132 @@ uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, con
   {
     result->strStdout = "";
     result->strStderror = "";
+    result->timedOut = false;
 
     char chBuf[4096];
-    DWORD dwOutputRead, dwErrorRead;
-    BOOL success = FALSE;
-    rdcstr s;
-    for(;;)
-    {
-      success = ReadFile(hChildStdOutput_Rd, chBuf, sizeof(chBuf), &dwOutputRead, NULL);
-      s = rdcstr(chBuf, dwOutputRead);
-      result->strStdout += s;
+    DWORD dwOutputRead;    // NOLINT(unused) - written by ReadFile below
 
-      if(!success && !dwOutputRead)
-        break;
-    }
+    bool timedOut = false;
+    const uint64_t startTime = Timing::GetTick();
 
-    for(;;)
-    {
-      success = ReadFile(hChildStdError_Rd, chBuf, sizeof(chBuf), &dwErrorRead, NULL);
-      s = rdcstr(chBuf, dwErrorRead);
-      result->strStderror += s;
+    // Timing::GetTick() returns raw performance counter ticks, not milliseconds - the frequency
+    // is ticks-per-millisecond, so it has to be divided out to get an elapsed time we can compare
+    // against a timeout in ms (dividing by the raw QPC frequency instead would be off by 1000x).
+    auto elapsedMS = [&startTime]() -> uint32_t {
+      return (uint32_t)((Timing::GetTick() - startTime) / Timing::GetTickFrequency());
+    };
 
-      if(!success && !dwErrorRead)
-        break;
-    }
+    // Read a pipe until it closes, but never block forever. PeekNamedPipe tells us how much data
+    // is waiting, so we only ever read what is there - a child that writes more than the pipe
+    // buffer holds can't deadlock waiting for us. When there is nothing buffered we wait on the
+    // process with a short timeout so a deadline can be enforced.
+    auto drainPipe = [&](HANDLE hPipe, rdcstr &out) {
+      for(;;)
+      {
+        // enforce the deadline even when the child keeps producing output
+        if(timeoutMS > 0 && elapsedMS() >= timeoutMS)
+        {
+          timedOut = true;
+          return;
+        }
+
+        DWORD avail = 0;
+        if(!PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL))
+        {
+          const DWORD err = GetLastError();
+
+          if(err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA)
+          {
+            // the write end is gone. The pipe buffer may still hold the last of the output, so
+            // drain it - ReadFile reports EOF (and then ERROR_BROKEN_PIPE) once it is empty.
+            for(;;)
+            {
+              DWORD read = 0;
+              if(!ReadFile(hPipe, chBuf, (DWORD)sizeof(chBuf), &read, NULL) || read == 0)
+                return;
+
+              out += rdcstr(chBuf, read);
+            }
+          }
+
+          // Any other failure is transient and must NOT be treated as EOF. Returning here would
+          // fall through to the wait below with an unread (possibly full) pipe and hang on a
+          // wedged child - which is exactly how an adb client outlived its timeout and held its
+          // server connection (and the device transport) open forever. Wait a moment on the
+          // process and try again instead.
+          if(WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0)
+          {
+            // the process is gone; one last read attempt in case data landed meanwhile
+            DWORD read = 0;
+            if(ReadFile(hPipe, chBuf, (DWORD)sizeof(chBuf), &read, NULL) && read > 0)
+              out += rdcstr(chBuf, read);
+            return;
+          }
+
+          continue;
+        }
+
+        if(avail == 0)
+        {
+          DWORD wait = WaitForSingleObject(pi.hProcess, 20);
+
+          if(wait == WAIT_OBJECT_0)
+          {
+            // the process has exited, anything left in the buffer is the last output
+            if(!PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) || avail == 0)
+              return;
+          }
+
+          continue;
+        }
+
+        DWORD toRead = avail;
+        if(toRead > (DWORD)sizeof(chBuf))
+          toRead = (DWORD)sizeof(chBuf);
+
+        if(!ReadFile(hPipe, chBuf, toRead, &dwOutputRead, NULL) || dwOutputRead == 0)
+          return;
+
+        out += rdcstr(chBuf, dwOutputRead);
+      }
+    };
+
+    drainPipe(hChildStdOutput_Rd, result->strStdout);
+    if(!timedOut)
+      drainPipe(hChildStdError_Rd, result->strStderror);
 
     CloseHandle(hChildStdOutput_Rd);
     CloseHandle(hChildStdError_Rd);
+    hChildStdOutput_Rd = NULL;
+    hChildStdError_Rd = NULL;
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, (LPDWORD)&result->retCode);
+    // The pipes may report EOF while the child is still alive (it can close its stdout early and
+    // keep running), so this final wait must be bounded by the same deadline - an unbounded wait
+    // here is how a wedged child survived past its timeout and leaked a live server connection.
+    if(!timedOut && timeoutMS > 0 && elapsedMS() >= timeoutMS)
+      timedOut = true;
+
+    if(!timedOut)
+    {
+      DWORD waitMS = timeoutMS > 0 ? timeoutMS - elapsedMS() : INFINITE;
+
+      if(WaitForSingleObject(pi.hProcess, waitMS) != WAIT_OBJECT_0)
+        timedOut = true;
+    }
+
+    if(timedOut)
+    {
+      RDCWARN("Process '%s' didn't finish within %u ms - terminating it", appPath.c_str(),
+              timeoutMS);
+      TerminateProcess(pi.hProcess, 0);
+      WaitForSingleObject(pi.hProcess, 5000);
+      result->retCode = -1;
+      result->timedOut = true;
+    }
+    else
+    {
+      GetExitCodeProcess(pi.hProcess, (LPDWORD)&result->retCode);
+    }
   }
 
   CloseHandle(pi.hThread);
@@ -1117,12 +1213,13 @@ uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, con
 }
 
 uint32_t Process::LaunchScript(const rdcstr &script, const rdcstr &workingDir,
-                               const rdcstr &argList, bool internal, ProcessResult *result)
+                               const rdcstr &argList, bool internal, ProcessResult *result,
+                               uint32_t timeoutMS)
 {
   // Change parameters to invoke command interpreter
   rdcstr args = "/C " + script + " " + argList;
 
-  return LaunchProcess("cmd.exe", workingDir, args, internal, result);
+  return LaunchProcess("cmd.exe", workingDir, args, internal, result, timeoutMS);
 }
 
 rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(

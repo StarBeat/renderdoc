@@ -34,8 +34,35 @@ namespace Android
 {
 Process::ProcessResult execScript(const rdcstr &script, const rdcstr &args,
                                   const rdcstr &workDir = ".", bool silent = false);
+// timeoutMS of 0 waits forever. Anything running adb should pass a timeout - see
+// Android_AdbTimeoutMS - because adb can wedge and would otherwise block the caller.
 Process::ProcessResult execCommand(const rdcstr &exe, const rdcstr &args,
-                                   const rdcstr &workDir = ".", bool silent = false);
+                                   const rdcstr &workDir = ".", bool silent = false,
+                                   uint32_t timeoutMS = 0);
+
+// Issues 'adb root' at most once per device per session. The result is also persisted to disk so
+// restarting the application doesn't re-issue it against every device - 'adb root' restarts adbd,
+// which is slow and disruptive. A persisted result is only trusted while the device's build
+// fingerprint still matches the one stored with it, so reflashing a device re-checks it.
+//
+// 'executed' (optional) is set to true when this call actually issued 'adb root'. A successful
+// root restarts adbd, and on devices that can't be rooted the daemon can end up wedged - callers
+// that want to run further adb commands should hold off until the next check when this is set.
+Process::ProcessResult adbRootOnce(const rdcstr &deviceID, bool *executed = nullptr);
+
+// true when adbRootOnce returned a result loaded from the persistent cache rather than one
+// freshly obtained by running 'adb root' this session
+bool adbRootResultCached(const rdcstr &deviceID);
+
+// Discards the cached 'adb root' result for the device so the next adbRootOnce call issues the
+// command again. Call this when the device state contradicts the cached result, e.g. the cached
+// result said root was available but 'whoami' reports a non-root user.
+void adbRootCacheInvalidate(const rdcstr &deviceID);
+
+// true while a device's adb channel is considered broken because several consecutive adb commands
+// timed out (see Android_AdbFailFastThreshold/Android_AdbFailFastCooldownMS). Commands for such a
+// device fail immediately instead of waiting for the timeout again.
+bool adbChannelUnusable(const rdcstr &deviceID);
 
 enum class ToolDir
 {

@@ -239,6 +239,10 @@ void *intercept_dlopen(const char *filename, int flag)
   return NULL;
 }
 
+// defined further down, next to the stealth filters: records the real vulkan loader entry point
+// whenever we interpose on one (see the comment on the definition for why this is needed).
+static void RememberRealVulkanEntry(const char *name, void *func);
+
 // we need this on both paths since interceptor-lib is unable to hook dlopen in libvulkan.so
 static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *data)
 {
@@ -408,6 +412,11 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
         // note we don't save the orig function here, since we want to apply our library priorities
         // and we don't know what order these headers will be iterated in. See EndHookRegistration
         // for where we iterate and fetch all the function pointers we want.
+        //
+        // the only exception is the vulkan loader entry points we filter for stealth reasons: for
+        // those we keep the real pointer (dladdr-guarded, see RememberRealVulkanEntry) so the
+        // filter can always forward, even when the loader is not in the global symbol scope.
+        RememberRealVulkanEntry(importname, *import);
         *import = repl.hook;
 
         if(pagebase)
@@ -465,6 +474,9 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
           }
         }
 
+        // see RememberRealVulkanEntry: a GOT slot always holds an already-resolved address, so
+        // this is a second reliable source for the real loader entry point.
+        RememberRealVulkanEntry(importname, *import);
         *import = repl.hook;
 
         if(pagebase && !relro_failed)
@@ -506,6 +518,51 @@ void process_dlopen(const char *filename, int flag)
 static PFN_vkEnumerateInstanceLayerProperties Real_vkEnumerateInstanceLayerProperties = NULL;
 static PFN_vkGetInstanceProcAddr Real_vkGetInstanceProcAddr = NULL;
 static void RegisterStealthHooks();
+
+// stealth: the filters below have to forward to the *real* loader entry points. Resolving them
+// with dlsym(RTLD_DEFAULT, ...) alone is not reliable: applications very commonly
+// dlopen("libvulkan.so") without RTLD_GLOBAL (that is bionic's default), in which case the
+// loader's symbols are not in the global scope at all and the lookup fails. A filter that then
+// returns NULL makes engines such as UE4 report "No Vulkan entry points found!" and silently
+// fall back to OpenGL ES.
+//
+// Every time we interpose on one of these symbols we already hold its real address - the dlsym
+// result the app would have got, or the value the linker resolved into a GOT slot - so record it
+// here. dladdr() guards the capture: a PLT stub (which would jump through the slot we are about
+// to overwrite and recurse) or one of our own functions is never recorded.
+static void RememberRealVulkanEntry(const char *name, void *func)
+{
+  if(name == NULL || func == NULL)
+    return;
+
+  if(strcmp(name, "vkGetInstanceProcAddr") != 0 &&
+     strcmp(name, "vkEnumerateInstanceLayerProperties") != 0)
+    return;
+
+  Dl_info info = {};
+  if(dladdr(func, &info) == 0 || info.dli_fname == NULL ||
+     strstr(info.dli_fname, "libvulkan") == NULL)
+    return;
+
+  if(strcmp(name, "vkGetInstanceProcAddr") == 0)
+  {
+    if(Real_vkGetInstanceProcAddr == NULL)
+    {
+      Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)func;
+      // RDCLOG rather than HOOK_DEBUG_PRINT: this happens at most once and confirms from the
+      // device log that the filter has a real target to forward to.
+      RDCLOG("Captured real vkGetInstanceProcAddr %p from %s", func, info.dli_fname);
+    }
+  }
+  else
+  {
+    if(Real_vkEnumerateInstanceLayerProperties == NULL)
+    {
+      Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)func;
+      RDCLOG("Captured real vkEnumerateInstanceLayerProperties %p from %s", func, info.dli_fname);
+    }
+  }
+}
 
 extern "C" __attribute__((visibility("default"))) void *hooked_dlopen(const char *filename, int flag)
 {
@@ -602,6 +659,9 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
       !strcmp(symbol, "vkGetInstanceProcAddr")))
   {
     HOOK_DEBUG_PRINT("returning filtered %s for dlsym in %s", symbol, info.dli_fname);
+    // remember the real entry point we are standing in front of - this is the resolution the
+    // application asked for and it is always valid, unlike a later RTLD_DEFAULT lookup
+    RememberRealVulkanEntry(symbol, ret);
     return repl.hook;
   }
 
@@ -852,7 +912,16 @@ static VkResult VKAPI_PTR Filtered_vkEnumerateInstanceLayerProperties(
     Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)dlsym(
         RTLD_DEFAULT, "vkEnumerateInstanceLayerProperties");
 
-  if(!Real_vkEnumerateInstanceLayerProperties || !pPropertyCount)
+  if(!Real_vkEnumerateInstanceLayerProperties)
+  {
+    // never expose the layer by falling through to something else - but make the failure loud,
+    // an app that gets a failure here will typically fall back to another graphics API.
+    RDCERR("The real vkEnumerateInstanceLayerProperties couldn't be resolved - refusing to "
+           "enumerate layers rather than exposing " RENDERDOC_VULKAN_LAYER_NAME);
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  if(!pPropertyCount)
     return VK_ERROR_INITIALIZATION_FAILED;
 
   // fetch the full list from the real loader
@@ -906,7 +975,13 @@ static PFN_vkVoidFunction VKAPI_PTR Filtered_vkGetInstanceProcAddr(VkInstance in
     Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
 
   if(!Real_vkGetInstanceProcAddr)
+  {
+    // this is what makes an engine report "No Vulkan entry points found!" and drop to GLES, so
+    // log it - seeing this line means a resolution source is missing, not that the driver failed.
+    RDCERR("The real vkGetInstanceProcAddr couldn't be resolved - returning NULL for %s",
+           pName ? pName : "<null>");
     return NULL;
+  }
 
   return Real_vkGetInstanceProcAddr(instance, pName);
 }
