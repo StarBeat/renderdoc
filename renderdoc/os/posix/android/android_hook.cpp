@@ -623,6 +623,10 @@ extern "C" __attribute__((visibility("default"))) void *hooked_android_dlopen_ex
 
 bool hooks_suppressed();
 
+extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *handle,
+                                                                      const char *symbol,
+                                                                      const char *version);
+
 extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handle, const char *symbol)
 {
   if(handle == NULL || symbol == NULL || hooks_suppressed())
@@ -652,6 +656,11 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
   dladdr(ret, &info);
   HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
 
+  // if the app asks for the versioned lookup itself, give it our interposed version so the
+  // stealth enumeration filter can't be bypassed through it either
+  if(!strcmp(symbol, "dlvsym"))
+    return (void *)&hooked_dlvsym;
+
   // stealth: if the app resolves the vulkan loader's enumeration entry points via dlsym
   // (bypassing the PLT hooks), give it the filtered versions so our layer name stays hidden.
   if(info.dli_fname && strstr(info.dli_fname, "libvulkan") &&
@@ -661,6 +670,50 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
     HOOK_DEBUG_PRINT("returning filtered %s for dlsym in %s", symbol, info.dli_fname);
     // remember the real entry point we are standing in front of - this is the resolution the
     // application asked for and it is always valid, unlike a later RTLD_DEFAULT lookup
+    RememberRealVulkanEntry(symbol, ret);
+    return repl.hook;
+  }
+
+  return ret;
+}
+
+extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *handle,
+                                                                      const char *symbol,
+                                                                      const char *version)
+{
+  if(handle == NULL || symbol == NULL || hooks_suppressed())
+    return dlvsym(handle, symbol, version);
+
+  const FunctionHook repl = GetHookInfo().GetFunctionHook(symbol);
+
+  if(repl.hook == NULL)
+    return dlvsym(handle, symbol, version);
+
+  if(!GetHookInfo().IsHooked(handle))
+  {
+    dl_iterate_phdr(dl_iterate_callback, NULL);
+    GetHookInfo().SetHooked(handle);
+  }
+
+  HOOK_DEBUG_PRINT("Got dlvsym for %s which we want in %p...", symbol, handle);
+
+  if(GetHookInfo().IsLibHook(handle))
+  {
+    HOOK_DEBUG_PRINT("identified dlvsym(%s) we want to interpose! returning %p", symbol, repl.hook);
+    return repl.hook;
+  }
+
+  void *ret = dlvsym(handle, symbol, version);
+  Dl_info info = {};
+  dladdr(ret, &info);
+  HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
+
+  // stealth: same filtering as hooked_dlsym, for apps that use the versioned lookup instead
+  if(info.dli_fname && strstr(info.dli_fname, "libvulkan") &&
+     (!strcmp(symbol, "vkEnumerateInstanceLayerProperties") ||
+      !strcmp(symbol, "vkGetInstanceProcAddr")))
+  {
+    HOOK_DEBUG_PRINT("returning filtered %s for dlvsym in %s", symbol, info.dli_fname);
     RememberRealVulkanEntry(symbol, ret);
     return repl.hook;
   }
@@ -714,6 +767,10 @@ static void InstallHooksCommon()
   // always hook dlsym: apps resolve loader entry points through dlsym as well as through
   // vkGetInstanceProcAddr, and the stealth vulkan enumeration filter relies on intercepting both
   LibraryHooks::RegisterFunctionHook("", FunctionHook("dlsym", NULL, (void *)&hooked_dlsym));
+
+  // dlvsym is the versioned equivalent of dlsym - hook it too so the stealth enumeration filter
+  // can't be bypassed with a versioned lookup
+  LibraryHooks::RegisterFunctionHook("", FunctionHook("dlvsym", NULL, (void *)&hooked_dlvsym));
 
   LibraryHooks::RegisterFunctionHook(
       "", FunctionHook("android_dlopen_ext", NULL, (void *)&hooked_android_dlopen_ext));

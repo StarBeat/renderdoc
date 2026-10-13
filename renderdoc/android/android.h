@@ -33,6 +33,11 @@ bool IsHostADB(const char *hostname);
 rdcstr GetPackageName(const rdcstr &packageAndActivity);
 rdcstr GetActivityName(const rdcstr &packageAndActivity);
 void ResetCaptureSettings(const rdcstr &deviceID);
+// wrap.sh + LD_PRELOAD injection: stages the capture library and a wrapper script into the target
+// app's data directory and points wrap.<package> at it, so the next process start preloads the
+// library before any graphics driver loads. Requires a debuggable application.
+RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName);
+void ClearWrapInjection(const rdcstr &deviceID, const rdcstr &packageName);
 void ExtractDeviceIDAndIndex(const rdcstr &hostname, int &index, rdcstr &deviceID);
 // timeoutMS of 0 uses the default Android.AdbTimeoutMS. Long-running operations such as
 // installing or uninstalling a large APK should pass a much larger value so they aren't killed.

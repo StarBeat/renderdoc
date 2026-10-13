@@ -219,7 +219,7 @@ if(ANDROID)
         message(FATAL_ERROR "ABI ${ANDROID_ABI} is not supported.")
     endif()
 
-    set(RENDERDOC_ANDROID_PACKAGE_NAME "org.renderdoc.renderdoccmd.${ABI_EXTENSION_NAME}")
+    set(RENDERDOC_ANDROID_PACKAGE_NAME "com.gfxcore.${ABI_EXTENSION_NAME}")
 
     set(APK_FILE ${CMAKE_BINARY_DIR}/bin/${RENDERDOC_ANDROID_PACKAGE_NAME}.apk)
     add_custom_target(apk ALL
@@ -228,7 +228,7 @@ if(ANDROID)
     option(ENABLE_CUSTOM_WRAP_SCRIPT "Enable custom wrap.sh on Android to workaround Android bug" ON)
 
     # Copy in android package files, replacing the package name with the architecture-specific package name
-    configure_file(android/Loader.java ${CMAKE_CURRENT_BINARY_DIR}/src/org/renderdoc/renderdoccmd/Loader.java)
+    configure_file(android/Loader.java ${CMAKE_CURRENT_BINARY_DIR}/src/com/gfxcore/Loader.java)
     configure_file(android/AndroidManifest.xml ${CMAKE_CURRENT_BINARY_DIR}/AndroidManifest.xml)
     configure_file(android/icon.png ${CMAKE_CURRENT_BINARY_DIR}/res/drawable/icon.png COPYONLY)
 
@@ -302,12 +302,12 @@ if(ANDROID)
     if(NOT EXISTS ${D8_SCRIPT})
         set(DEX_COMMAND ${BUILD_TOOLS}/dx${TOOL_SCRIPT_EXTENSION} --dex --output=bin/classes.dex ./obj)
     else()
-        set(DEX_COMMAND ${D8_SCRIPT} --output ./bin/ ./obj/org/renderdoc/renderdoccmd/${ABI_EXTENSION_NAME}/*.class)
+        set(DEX_COMMAND ${D8_SCRIPT} --output ./bin/ ./obj/com/gfxcore/${ABI_EXTENSION_NAME}/*.class)
     endif()
 
     add_custom_command(OUTPUT ${APK_FILE} APPEND
                        COMMAND ${BUILD_TOOLS}/aapt package -f -m -S res -J src -M AndroidManifest.xml -I ${ANDROID_JAR}
-                       COMMAND ${JAVA_BIN}/javac -d ./obj -source ${JAVA_TARGET} -target ${JAVA_TARGET} -bootclasspath ${RT_JAR} -classpath "${CLASS_PATH}" -sourcepath src src/org/renderdoc/renderdoccmd/*.java
+                       COMMAND ${JAVA_BIN}/javac -d ./obj -source ${JAVA_TARGET} -target ${JAVA_TARGET} -bootclasspath ${RT_JAR} -classpath "${CLASS_PATH}" -sourcepath src src/com/gfxcore/*.java
                        COMMAND ${DEX_COMMAND}
                        COMMAND ${BUILD_TOOLS}/aapt package -f -M AndroidManifest.xml --version-code ${APK_VERSION_CODE} --version-name ${APK_VERSION_NAME} -S res -I ${ANDROID_JAR} -F RenderDocCmd-unaligned.apk bin libs
                        COMMAND ${BUILD_TOOLS}/zipalign -f 4 RenderDocCmd-unaligned.apk RenderDocCmd.apk

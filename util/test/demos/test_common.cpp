@@ -632,7 +632,7 @@ void GraphicsTest::Prepare(int argc, char **argv)
   if(mod)
     RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
 #elif defined(ANDROID)
-  void *mod = dlopen("libVkLayer_GLES_RenderDoc.so", RTLD_NOW | RTLD_NOLOAD);
+  void *mod = dlopen("libgfxcore.so", RTLD_NOW | RTLD_NOLOAD);
   if(mod)
     RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
 #elif defined(__linux__)

@@ -640,8 +640,147 @@ bool RemoveRenderDocAndroidServer(const rdcstr &deviceID)
   return true;
 }
 
+// tracks the last package that had wrap.sh preload injection staged, so ResetCaptureSettings
+// can remove its wrap property when the device session ends
+static rdcstr g_lastWrapPackage;
+
+// wrap.sh + LD_PRELOAD injection. The capture library lives in the renderdoc package's lib dir
+// which the target app's uid can't read, and /data/local/tmp files aren't executable by apps
+// under SELinux, so we stage the library and a wrapper script through the device shell into the
+// app's own data directory. Setting wrap.<package> makes the runtime execute the script in place
+// of the app's normal start, and the script LD_PRELOADs the library - it loads before any
+// graphics driver and hooks it via PLT patching. This path doesn't depend on the ROM honouring
+// the gpu_debug_* settings and doesn't involve a JDWP debugger session.
+RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
+{
+  rdcstr abiName = DetermineInstalledABI(deviceID, packageName);
+  ABI abi = GetABI(abiName);
+
+  if(abi == ABI::unknown)
+  {
+    RDCERR("Couldn't determine ABI for %s to prepare wrap injection", packageName.c_str());
+    return RDResult(ResultCode::AndroidABINotFound);
+  }
+
+  const rdcstr serverPkg = GetRenderDocPackageForABI(abi);
+  const rdcstr abiDir = (abi == ABI::arm64_v8a) ? "arm64" : "arm";
+  const rdcstr serverLib =
+      GetPathForPackage(deviceID, serverPkg) + "/lib/" + abiDir + "/" + RENDERDOC_ANDROID_LIBRARY;
+
+  const rdcstr stageDir = "/data/local/tmp/rdwrap";
+  const rdcstr appDataDir = "/data/user/0/" + packageName;
+
+  // export the library from the server package into a shell-readable staging directory. The
+  // redirection is performed by the device shell, so the output file is owned by the shell uid.
+  adbExecCommand(deviceID, "shell rm -rf " + stageDir, ".", true);
+  adbExecCommand(deviceID, "shell mkdir -p " + stageDir, ".", true);
+  adbExecCommand(deviceID, "shell chmod 755 " + stageDir, ".", true);
+
+  Process::ProcessResult cat = adbExecCommand(
+      deviceID,
+      "shell run-as " + serverPkg + " cat " + serverLib + " > " + stageDir + "/" +
+          RENDERDOC_ANDROID_LIBRARY,
+      ".", true, kAdbLongCommandTimeoutMS);
+
+  if(!cat.strStderror.empty() || cat.retCode != 0)
+  {
+    RDCERR("Failed to export %s from %s: %s", RENDERDOC_ANDROID_LIBRARY, serverPkg.c_str(),
+           cat.strStderror.trimmed().c_str());
+    return RDResult(ResultCode::InjectionFailed,
+                    "Failed to stage the capture library for wrap injection.");
+  }
+
+  adbExecCommand(deviceID, "shell chmod 644 " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY, ".",
+                 true);
+
+  // copy the library into the app's own data directory, as the app's uid so it can dlopen it
+  Process::ProcessResult cp = adbExecCommand(
+      deviceID,
+      "shell run-as " + packageName + " cp " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY + " " +
+          appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY,
+      ".", true);
+
+  if(!cp.strStderror.empty() || cp.retCode != 0)
+  {
+    RDCERR("Failed to copy %s into %s: %s", RENDERDOC_ANDROID_LIBRARY, appDataDir.c_str(),
+           cp.strStderror.trimmed().c_str());
+    return RDResult(ResultCode::InjectionFailed,
+                    "Failed to copy the capture library into the application data directory.");
+  }
+
+  adbExecCommand(deviceID,
+                 "shell run-as " + packageName + " chmod 755 " + appDataDir + "/" +
+                     RENDERDOC_ANDROID_LIBRARY,
+                 ".", true);
+
+  // generate the wrap script on the host and stage it into the app's data directory the same way
+  rdcstr script = "#!/system/bin/sh\n";
+  script += "export LD_PRELOAD=" + appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY + "\n";
+  script += "exec \"$@\"\n";
+
+  rdcstr localScript = FileIO::GetTempFolderFilename() + "/rdwrap.sh";
+  FILE *f = FileIO::fopen(localScript, FileIO::WriteText);
+  if(!f)
+  {
+    RDCERR("Couldn't write wrap script to %s", localScript.c_str());
+    return RDResult(ResultCode::InjectionFailed, "Failed to create the wrap.sh script.");
+  }
+  FileIO::fwrite(script.c_str(), 1, script.size(), f);
+  FileIO::fclose(f);
+
+  Process::ProcessResult push =
+      adbExecCommand(deviceID, "push \"" + localScript + "\" " + stageDir + "/wrap.sh", ".",
+                     true, kAdbLongCommandTimeoutMS);
+  FileIO::Delete(localScript);
+
+  if(!push.strStderror.empty() || push.retCode != 0)
+  {
+    RDCERR("Failed to push wrap.sh: %s", push.strStderror.trimmed().c_str());
+    return RDResult(ResultCode::InjectionFailed, "Failed to push the wrap.sh script.");
+  }
+
+  adbExecCommand(deviceID, "shell chmod 755 " + stageDir + "/wrap.sh", ".", true);
+
+  Process::ProcessResult cpScript = adbExecCommand(
+      deviceID,
+      "shell run-as " + packageName + " cp " + stageDir + "/wrap.sh " + appDataDir + "/rdwrap.sh",
+      ".", true);
+
+  if(!cpScript.strStderror.empty() || cpScript.retCode != 0)
+  {
+    RDCERR("Failed to copy wrap.sh into %s: %s", appDataDir.c_str(),
+           cpScript.strStderror.trimmed().c_str());
+    return RDResult(ResultCode::InjectionFailed,
+                    "Failed to copy the wrap.sh script into the application data directory.");
+  }
+
+  adbExecCommand(deviceID, "shell run-as " + packageName + " chmod 755 " + appDataDir + "/rdwrap.sh",
+                 ".", true);
+
+  adbExecCommand(deviceID,
+                 "shell setprop wrap." + packageName + " \"" + appDataDir + "/rdwrap.sh\"", ".",
+                 true);
+
+  g_lastWrapPackage = packageName;
+
+  RDCLOG("Staged wrap.sh preload injection for %s", packageName.c_str());
+  return RDResult(ResultCode::Succeeded);
+}
+
+void ClearWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
+{
+  Android::adbExecCommand(deviceID, "shell setprop wrap." + packageName + " \"\"", ".", true);
+}
+
 void ResetCaptureSettings(const rdcstr &deviceID)
 {
+  if(!g_lastWrapPackage.empty())
+  {
+    Android::adbExecCommand(deviceID, "shell setprop wrap." + g_lastWrapPackage + " \"\"", ".",
+                            true);
+    g_lastWrapPackage.clear();
+  }
+
   Android::adbExecCommand(deviceID, "shell setprop debug.vulkan.layers :", ".", true);
   Android::adbExecCommand(deviceID, "shell settings delete global enable_gpu_debug_layers", ".",
                           true);
@@ -1648,6 +1787,65 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
 
     // if the original launch already used JDWP injection, there's nothing to fall back to
     bool jdwpFallbackAttempted = (jdwpPort != 0);
+    bool wrapInjectionAttempted = false;
+    uint32_t wrapAttemptElapsed = 0;
+
+    // restarts the app under a JDWP debugger and injects via Runtime.load(). Returns true if the
+    // wait loop should stop.
+    auto tryJDWPFallback = [&]() -> bool {
+      jdwpFallbackAttempted = true;
+
+      if(!Android::IsDebuggable(m_deviceID, packageName))
+      {
+        RDCLOG(
+            "No connection from native GPU layering and '%s' is not debuggable - can't retry "
+            "with JDWP injection.",
+            packageName.c_str());
+        return false;
+      }
+
+      RDCLOG("Restarting '%s' with JDWP injection.", packageName.c_str());
+
+      uint16_t jdwpFallbackPort = Android::GetJdwpPort();
+
+      Android::adbExecCommand(m_deviceID, "shell am force-stop " + processName);
+
+      // start the activity with debugging enabled
+      Android::adbExecCommand(
+          m_deviceID, StringFormat::Fmt("shell am start -S -D -n %s/%s %s", packageName.c_str(),
+                                        activityName.c_str(), intentArgs.c_str()));
+
+      // sleep a little to let the activity start
+      Threading::Sleep(500);
+
+      int jdwpPid = Android::GetCurrentPID(m_deviceID, processName);
+
+      if(jdwpPid == 0)
+      {
+        SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                         "APK failed to restart for JDWP injection.");
+        return true;
+      }
+
+      Android::adbForwardPorts(m_portbase, m_deviceID, jdwpFallbackPort, jdwpPid, false);
+
+      // sleep a little to let the ports initialise
+      Threading::Sleep(500);
+
+      bool injected = Android::InjectWithJDWP(m_deviceID, jdwpFallbackPort);
+
+      if(!injected)
+      {
+        result = RDResult(ResultCode::JDWPFailure);
+        result.message = StringFormat::Fmt(
+            "Failed to inject using JDWP when retrying '%s' with activity '%s'",
+            packageName.c_str(), activityName.c_str());
+        return true;
+      }
+
+      RDCLOG("JDWP injection succeeded, waiting for the target control connection.");
+      return false;
+    };
 
     while(elapsed < timeout)
     {
@@ -1675,67 +1873,62 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
         break;
       }
 
-      if(!jdwpFallbackAttempted && elapsed >= nativeLayerGraceMS)
+      if(!jdwpFallbackAttempted)
       {
-        jdwpFallbackAttempted = true;
-
-        if(Android::IsDebuggable(m_deviceID, packageName))
+        if(!wrapInjectionAttempted && elapsed >= nativeLayerGraceMS)
         {
-          RDCLOG(
-              "No connection from native GPU layering within %u ms - the ROM may be ignoring the "
-              "debug layer settings. Restarting '%s' with JDWP injection.",
-              nativeLayerGraceMS, packageName.c_str());
+          // Phase 2: wrap.sh + LD_PRELOAD. Stage the library and wrapper script into the app's
+          // data directory, point wrap.<package> at it and restart the app normally - no debug
+          // layers and no debugger involved, the library loads before any graphics driver.
+          wrapInjectionAttempted =
+              (Android::PrepareWrapInjection(m_deviceID, packageName).code == ResultCode::Succeeded);
 
-          uint16_t jdwpFallbackPort = Android::GetJdwpPort();
-
-          Android::adbExecCommand(m_deviceID, "shell am force-stop " + processName);
-
-          // start the activity with debugging enabled
-          Android::adbExecCommand(
-              m_deviceID, StringFormat::Fmt("shell am start -S -D -n %s/%s %s", packageName.c_str(),
-                                            activityName.c_str(), intentArgs.c_str()));
-
-          // sleep a little to let the activity start
-          Threading::Sleep(500);
-
-          curpid = Android::GetCurrentPID(m_deviceID, processName);
-
-          if(curpid == 0)
+          if(wrapInjectionAttempted)
           {
-            SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
-                             "APK failed to restart for JDWP injection.");
-            break;
+            RDCLOG(
+                "No connection from native GPU layering within %u ms - the ROM may be ignoring "
+                "the debug layer settings. Restarting '%s' with wrap.sh preload injection.",
+                nativeLayerGraceMS, packageName.c_str());
+
+            wrapAttemptElapsed = elapsed;
+
+            Android::adbExecCommand(m_deviceID, "shell am force-stop " + processName);
+
+            Android::adbExecCommand(
+                m_deviceID, StringFormat::Fmt("shell am start -S -n %s/%s %s", packageName.c_str(),
+                                              activityName.c_str(), intentArgs.c_str()));
+
+            Threading::Sleep(500);
           }
-
-          Android::adbForwardPorts(m_portbase, m_deviceID, jdwpFallbackPort, curpid, false);
-
-          // sleep a little to let the ports initialise
-          Threading::Sleep(500);
-
-          bool injected = Android::InjectWithJDWP(m_deviceID, jdwpFallbackPort);
-
-          if(!injected)
+          else
           {
-            result = RDResult(ResultCode::JDWPFailure);
-            result.message = StringFormat::Fmt(
-                "Failed to inject using JDWP when retrying '%s' with activity '%s'",
-                packageName.c_str(), activityName.c_str());
-            break;
+            RDCLOG("wrap.sh staging failed, falling back to JDWP injection.");
+            if(tryJDWPFallback())
+              break;
           }
-
-          RDCLOG("JDWP injection succeeded, waiting for the target control connection.");
         }
-        else
+        else if(wrapInjectionAttempted && elapsed >= wrapAttemptElapsed + nativeLayerGraceMS)
         {
-          RDCLOG("No connection from native GPU layering and '%s' is not debuggable - can't retry "
-                 "with JDWP injection.",
-                 packageName.c_str());
+          // wrap injection also never connected - reset the wrap property and use JDWP instead.
+          Android::ClearWrapInjection(m_deviceID, packageName);
+          wrapInjectionAttempted = false;
+
+          RDCLOG("No connection from wrap.sh preload injection - trying JDWP injection.");
+          if(tryJDWPFallback())
+            break;
         }
       }
 
       Threading::Sleep(1000);
       elapsed += 1000;
     }
+
+    // if the connection never appeared, reset the wrap property so the application doesn't get
+    // the library preloaded the next time it's launched outside RenderDoc. On success the
+    // property is intentionally left in place for the session and cleared by
+    // ResetCaptureSettings when the device disconnects.
+    if(result.code != ResultCode::Succeeded && wrapInjectionAttempted)
+      Android::ClearWrapInjection(m_deviceID, packageName);
 
     // we leave the setprop in case the application later initialises a vulkan device. It's
     // impossible to tell if it will or not, since many applications will init and present from GLES
