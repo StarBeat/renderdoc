@@ -623,6 +623,10 @@ extern "C" __attribute__((visibility("default"))) void *hooked_android_dlopen_ex
 
 bool hooks_suppressed();
 
+// dlvsym exists in bionic at runtime but is only declared in the NDK headers at API levels
+// higher than our minimum target - declare it ourselves so we can interpose on it
+extern "C" void *dlvsym(void *handle, const char *symbol, const char *version);
+
 extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *handle,
                                                                       const char *symbol,
                                                                       const char *version);
@@ -681,13 +685,21 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *hand
                                                                       const char *symbol,
                                                                       const char *version)
 {
+  // dlvsym was only added to bionic in API 24 while we link against API 21, so resolve it at
+  // runtime. dlsym(RTLD_DEFAULT, ...) here passes straight through hooked_dlsym (RTLD_DEFAULT is
+  // NULL on android), so this gets the real libc implementation.
+  static void *(*real_dlvsym)(void *, const char *, const char *) = NULL;
+
+  if(real_dlvsym == NULL)
+    real_dlvsym = (void *(*)(void *, const char *, const char *))dlsym(RTLD_DEFAULT, "dlvsym");
+
   if(handle == NULL || symbol == NULL || hooks_suppressed())
-    return dlvsym(handle, symbol, version);
+    return real_dlvsym ? real_dlvsym(handle, symbol, version) : NULL;
 
   const FunctionHook repl = GetHookInfo().GetFunctionHook(symbol);
 
   if(repl.hook == NULL)
-    return dlvsym(handle, symbol, version);
+    return real_dlvsym ? real_dlvsym(handle, symbol, version) : NULL;
 
   if(!GetHookInfo().IsHooked(handle))
   {
@@ -703,7 +715,7 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *hand
     return repl.hook;
   }
 
-  void *ret = dlvsym(handle, symbol, version);
+  void *ret = real_dlvsym ? real_dlvsym(handle, symbol, version) : NULL;
   Dl_info info = {};
   dladdr(ret, &info);
   HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
