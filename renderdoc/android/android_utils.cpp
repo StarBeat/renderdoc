@@ -325,6 +325,14 @@ bool HasRootAccess(const rdcstr &deviceID)
   if(checksu == "found")
     return true;
 
+  // KernelSU and Magisk on modern devices install su into /system/bin/su - /system/xbin no longer
+  // exists on Android 10+, and 'adb root' remains unavailable on production builds even though the
+  // su root shell works fine from adb shell.
+  rdcstr checksuBin =
+      adbExecCommand(deviceID, "shell test -e /system/bin/su && echo found").strStdout.trimmed();
+  if(checksuBin == "found")
+    return true;
+
   return false;
 }
 

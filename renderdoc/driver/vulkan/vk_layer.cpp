@@ -38,6 +38,11 @@
 
 extern "C" const rdcstr VulkanLayerJSONBasename;
 
+#if ENABLED(RDOC_ANDROID)
+// set by vk_device_funcs.cpp when the loader hands us the chain link during instance creation
+PFN_vkGetInstanceProcAddr gchainGPA_capture = NULL;
+#endif
+
 // this was removed from the vulkan definition header
 #undef VK_LAYER_EXPORT
 #define VK_LAYER_EXPORT
@@ -55,6 +60,277 @@ extern "C" const rdcstr VulkanLayerJSONBasename;
 
 #if ENABLED(RDOC_ANDROID)
 #include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+
+// Find another loaded copy of this same library (by ELF soname) and return its base address.
+// Our library exists twice on Android with the wrap.sh flow: once LD_PRELOADed as
+// libgfxcore.so, and once dlopened RTLD_LOCAL by the vulkan loader as
+// libVkLayer_RENDERDOC_Capture.so. Each copy has its own static pools, so a handle allocated
+// by one copy is foreign to the other. dl_iterate_phdr sees RTLD_LOCAL objects too, unlike
+// dlsym(RTLD_NEXT).
+struct FindOtherCopyCtx
+{
+  const char *selfName;
+  uintptr_t selfBase;
+  uintptr_t otherBase;
+};
+
+static int find_other_copy_cb(struct dl_phdr_info *info, size_t, void *data)
+{
+  FindOtherCopyCtx *ctx = (FindOtherCopyCtx *)data;
+  if(info->dlpi_name == NULL)
+    return 0;
+  const char *name = info->dlpi_name;
+  // match either of our two deployment names - the preloaded libgfxcore.so and the vulkan
+  // layer library are the same binary under different names
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  bool isOurs = (strcmp(base, "libgfxcore.so") == 0 ||
+                 strcmp(base, "libVkLayer_RENDERDOC_Capture.so") == 0);
+  if(!isOurs)
+    return 0;
+  if((uintptr_t)info->dlpi_addr == ctx->selfBase)
+    return 0;
+  ctx->otherBase = (uintptr_t)info->dlpi_addr;
+  return 1;
+}
+
+// resolve an exported symbol from another loaded copy of this library by walking its
+// dynamic symbol table manually (dlsym can't reach an RTLD_LOCAL object by name)
+static void *GetOtherCopyExport(const char *selfName, const char *symbol)
+{
+  Dl_info self = {};
+  void *pivot = (void *)&GetOtherCopyExport;
+  dladdr(pivot, &self);
+  if(self.dli_fname == NULL)
+    return NULL;
+
+  const char *selfBaseName = strrchr(self.dli_fname, '/');
+  selfBaseName = selfBaseName ? selfBaseName + 1 : self.dli_fname;
+
+  FindOtherCopyCtx ctx = {selfBaseName, (uintptr_t)self.dli_fbase, 0};
+  dl_iterate_phdr(find_other_copy_cb, &ctx);
+  if(ctx.otherBase == 0)
+    return NULL;
+
+  // parse the ELF at that base: PT_DYNAMIC -> DT_SYMTAB/DT_STRTAB/DT_HASH or DT_GNU_HASH
+  const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)ctx.otherBase;
+  const Elf64_Phdr *phdr = (const Elf64_Phdr *)(ctx.otherBase + ehdr->e_phoff);
+  const Elf64_Dyn *dyn = NULL;
+  for(int i = 0; i < ehdr->e_phnum; i++)
+  {
+    if(phdr[i].p_type == PT_DYNAMIC)
+    {
+      dyn = (const Elf64_Dyn *)(ctx.otherBase + phdr[i].p_vaddr);
+      break;
+    }
+  }
+  if(!dyn)
+    return NULL;
+
+  const Elf64_Sym *symtab = NULL;
+  const char *strtab = NULL;
+  uint32_t symcount = 0;
+  // DT_HASH gives nchain == symbol count
+  for(const Elf64_Dyn *d = (const Elf64_Dyn *)dyn; d->d_tag != DT_NULL; d++)
+  {
+    if(d->d_tag == DT_SYMTAB)
+      symtab = (const Elf64_Sym *)(ctx.otherBase + d->d_un.d_ptr);
+    else if(d->d_tag == DT_STRTAB)
+      strtab = (const char *)(ctx.otherBase + d->d_un.d_ptr);
+    else if(d->d_tag == DT_HASH)
+    {
+      const uint32_t *hash = (const uint32_t *)(ctx.otherBase + d->d_un.d_ptr);
+      symcount = hash[1];
+    }
+  }
+  if(!symtab || !strtab || symcount == 0)
+    return NULL;
+
+  for(uint32_t i = 0; i < symcount; i++)
+  {
+    if(symtab[i].st_name == 0 || symtab[i].st_value == 0)
+      continue;
+    if(ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC)
+      continue;
+    if(strcmp(strtab + symtab[i].st_name, symbol) == 0)
+      return (void *)(ctx.otherBase + symtab[i].st_value);
+  }
+  return NULL;
+}
+
+// On this Android setup the game's engine (libGame.so) resolves vkGetInstanceProcAddr from
+// libvulkan after our layer has been inserted, and the loader dispatches its queries down the
+// layer chain to us while passing the loader-internal VkInstance handle rather than the
+// wrapped handle we returned from hooked_vkCreateInstance. Aborting (the historical
+// behaviour) or handing back one of our hooked functions crashes, since that handle is not
+// one of our WrappedVkInstance allocations.
+//
+// We translate the loader-internal handle back to our wrapped instance with the map
+// populated during instance creation; if it isn't in the map we forward the query down the
+// rest of the chain using the GPA the loader handed us in the layer chain link.
+static PFN_vkGetInstanceProcAddr gchainGPA = NULL;
+static PFN_vkGetDeviceProcAddr gchainGDPA = NULL;
+extern PFN_vkGetInstanceProcAddr gchainGPA_capture;
+
+// loader-internal instance handle -> our wrapped instance handle, populated in
+// WrappedVulkan::vkCreateInstance (vk_device_funcs.cpp)
+#include <map>
+static std::map<void *, VkInstance> gloaderToWrapped;
+static Threading::CriticalSection gloaderMapLock;
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr(VkInstance instance, const char *pName);
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr_fwd(VkInstance instance, const char *pName)
+{
+  return VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr(instance, pName);
+}
+
+void RDCLayerHookedInstanceCreated(void *loaderHandle, void *wrappedHandle)
+{
+  SCOPED_LOCK(gloaderMapLock);
+  gloaderToWrapped[loaderHandle] = (VkInstance)wrappedHandle;
+}
+
+static void LogForeignCaller(const char *api, const void *instance, const char *pName)
+{
+  Dl_info info = {};
+  void *caller = __builtin_return_address(2);
+  dladdr(caller, &info);
+  RDCLOG("%s sees foreign %s handle %p (asking for %s), caller %p in %s", api,
+         api[0] == 'G' && strstr(api, "Device") ? "device" : "instance", instance, pName, caller,
+         info.dli_fname ? info.dli_fname : "unknown");
+  // walk a few frames manually to identify exactly who is dispatching to this copy
+  void *frames[6] = {};
+  frames[0] = __builtin_return_address(0);
+  frames[1] = __builtin_return_address(1);
+  frames[2] = __builtin_return_address(2);
+  frames[3] = __builtin_return_address(3);
+  frames[4] = __builtin_return_address(4);
+  for(int i = 0; i < 5; i++)
+  {
+    if(frames[i] == NULL)
+      break;
+    Dl_info fi = {};
+    dladdr(frames[i], &fi);
+    RDCLOG("  frame %d: %p in %s + %llu", i, frames[i], fi.dli_fname ? fi.dli_fname : "?",
+           fi.dli_fname ? (unsigned long long)((char *)frames[i] - (char *)fi.dli_fbase) : 0ULL);
+  }
+}
+
+static bool ForeignInstancePassthrough(VkInstance instance, const char *pName,
+                                       PFN_vkVoidFunction *outFunc)
+{
+  if(instance == VK_NULL_HANDLE || WrappedVkInstance::IsAlloc(instance))
+    return false;
+
+  // translate the loader-internal handle back to our wrapped instance
+  {
+    VkInstance wrapped = VK_NULL_HANDLE;
+    {
+      SCOPED_LOCK(gloaderMapLock);
+      auto it = gloaderToWrapped.find((void *)instance);
+      if(it != gloaderToWrapped.end())
+        wrapped = it->second;
+    }
+
+    if(wrapped != VK_NULL_HANDLE)
+    {
+      static bool translated = false;
+      if(!translated)
+      {
+        translated = true;
+        RDCLOG("Translating loader-internal instance %p back to wrapped %p", (void *)instance,
+               (void *)wrapped);
+      }
+
+      // resolve the query for the wrapped handle ourselves, as normal
+      *outFunc = VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr_fwd(wrapped, pName);
+      return true;
+    }
+  }
+
+  static bool logged = false;
+  if(!logged)
+  {
+    logged = true;
+    Dl_info self = {};
+    dladdr((void *)&ForeignInstancePassthrough, &self);
+    LogForeignCaller("GetInstanceProcAddr", (const void *)instance, pName);
+    RDCLOG("...GIPA running in copy at %s (base %p)", self.dli_fname ? self.dli_fname : "?",
+           self.dli_fbase);
+  }
+  // We are likely the LD_PRELOAD copy while the layer copy (dlopened by the loader as
+  // libVkLayer_RENDERDOC_Capture.so) allocated this handle in its own pool. Find that other
+  // copy's exported GIPA and let it handle its own instance.
+  {
+    static PFN_vkVoidFunction (*otherCopyGIPA)(VkInstance, const char *) = NULL;
+    static bool searched = false;
+    if(!searched)
+    {
+      searched = true;
+      otherCopyGIPA = (PFN_vkVoidFunction(*)(VkInstance, const char *))GetOtherCopyExport(
+          NULL, "VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr");
+      if(otherCopyGIPA)
+        RDCLOG("Found other copy GIPA at %p - foreign handles will be delegated to it",
+               (void *)otherCopyGIPA);
+    }
+
+    if(otherCopyGIPA)
+    {
+      *outFunc = otherCopyGIPA(instance, pName);
+      return true;
+    }
+  }
+
+  // fallback: try to resolve the symbol through the loader's own GIPA - this is the entry the
+  // engine would have used without us, and the loader recognises the handle
+  {
+    static PFN_vkGetInstanceProcAddr realGPA = NULL;
+    if(!realGPA)
+    {
+      void *module = Process::LoadModule("libvulkan.so");
+      if(module)
+        realGPA = (PFN_vkGetInstanceProcAddr)Process::GetFunctionAddress(module,
+                                                                          "vkGetInstanceProcAddr");
+    }
+    if(realGPA)
+    {
+      PFN_vkVoidFunction fn = (PFN_vkVoidFunction)realGPA(instance, pName);
+      static int nullCount = 0;
+      if(fn == NULL && nullCount < 3)
+      {
+        nullCount++;
+        RDCLOG("foreign GIPA(%p, %s): loader returned NULL", (void *)instance, pName);
+      }
+      *outFunc = fn;
+      return true;
+    }
+  }
+
+  *outFunc = NULL;
+  return true;
+}
+
+static bool ForeignDevicePassthrough(VkDevice device, const char *pName, PFN_vkVoidFunction *outFunc)
+{
+  if(device == VK_NULL_HANDLE || WrappedVkDevice::IsAlloc(device))
+    return false;
+
+  static bool logged = false;
+  if(!logged)
+  {
+    logged = true;
+    LogForeignCaller("GetDeviceProcAddr", (const void *)device, pName);
+  }
+
+  // see ForeignInstancePassthrough - unknown handle, we cannot resolve for it
+  *outFunc = NULL;
+  return true;
+}
 
 void KeepLayerAlive()
 {
@@ -284,6 +560,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hooked_vkCreateInstance(const VkInstanceCreateInf
                                                        const VkAllocationCallbacks *,
                                                        VkInstance *pInstance)
 {
+  RDCLOG("hooked_vkCreateInstance called from app: %s",
+         (pCreateInfo && pCreateInfo->pApplicationInfo &&
+          pCreateInfo->pApplicationInfo->pApplicationName)
+             ? pCreateInfo->pApplicationInfo->pApplicationName
+             : "(no app name)");
   KeepLayerAlive();
 
   WrappedVulkan *core = new WrappedVulkan();
@@ -432,6 +713,14 @@ VK_LAYER_RENDERDOC_CaptureGetDeviceProcAddr(VkDevice device, const char *pName)
   if(!strcmp("vkDestroyDevice", pName))
     return (PFN_vkVoidFunction)&hooked_vkDestroyDevice;
 
+#if ENABLED(RDOC_ANDROID)
+  {
+    PFN_vkVoidFunction passthrough = NULL;
+    if(device != VK_NULL_HANDLE && ForeignDevicePassthrough(device, pName, &passthrough))
+      return passthrough;
+  }
+#endif
+
   HookInitVulkanDevice();
 
   if(device == VK_NULL_HANDLE)
@@ -482,6 +771,22 @@ VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr(VkInstance instance, const char *p
 
   if(instance == VK_NULL_HANDLE)
     return NULL;
+
+#if ENABLED(RDOC_ANDROID)
+  {
+    // log the first few foreign handles only - with the single-copy staging this should never
+    // trigger; if it does, the library got mapped twice (see PrepareWrapInjection)
+    static int traceCount = 0;
+    if(traceCount < 10 && !WrappedVkInstance::IsAlloc(instance))
+    {
+      traceCount++;
+      RDCLOG("GIPA trace: FOREIGN instance %p for %s", (void *)instance, pName);
+    }
+    PFN_vkVoidFunction passthrough = NULL;
+    if(ForeignInstancePassthrough(instance, pName, &passthrough))
+      return passthrough;
+  }
+#endif
 
   if(!strcmp("vkEnumerateDeviceLayerProperties", pName))
     return (PFN_vkVoidFunction)&VK_LAYER_RENDERDOC_CaptureEnumerateDeviceLayerProperties;
@@ -547,6 +852,72 @@ VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr(VkInstance instance, const char *p
   return NULL;
 }
 
+#if ENABLED(RDOC_ANDROID)
+
+// ==== no-layer (PLT hook) capture path ====
+//
+// When the vulkan calls are intercepted by the PLT hooks in android_hook.cpp instead of the
+// loader inserting us as a debug layer, these exports let the hook filters drive the same
+// wrapping code the layer chain normally drives.
+
+// set to true when the loader activates us as a layer (NegotiateLoaderLayerInterfaceVersion),
+// set to true when the PLT path activates the no-layer capture instead
+static bool gAndroidVKLayerActive = false;
+static bool gAndroidVKPLTActive = false;
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR int VKAPI_CALL RDCAndroidVKCaptureMode(void)
+{
+  if(gAndroidVKPLTActive)
+    return 1;
+  if(gAndroidVKLayerActive)
+    return 0;
+  return -1;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL RDCAndroidSetVKPLTMode(int active)
+{
+  gAndroidVKPLTActive = active != 0;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL RDCAndroidPLTCreateInstance(
+    const VkInstanceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator,
+    VkInstance *pInstance)
+{
+  return hooked_vkCreateInstance(pCreateInfo, pAllocator, pInstance);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL RDCAndroidPLTCreateDevice(
+    VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
+{
+  return hooked_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+RDCAndroidLayerGetInstanceProcAddr(VkInstance instance, const char *pName)
+{
+  return VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr(instance, pName);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+RDCAndroidLayerGetDeviceProcAddr(VkDevice device, const char *pName)
+{
+  return VK_LAYER_RENDERDOC_CaptureGetDeviceProcAddr(device, pName);
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkInstance VKAPI_CALL
+RDCAndroidInstanceRealHandle(VkInstance instance)
+{
+  return WrappedVkInstance::IsAlloc(instance) ? Unwrap(instance) : instance;
+}
+
+extern "C" VK_LAYER_EXPORT VKAPI_ATTR VkDevice VKAPI_CALL RDCAndroidDeviceRealHandle(VkDevice device)
+{
+  return WrappedVkDevice::IsAlloc(device) ? Unwrap(device) : device;
+}
+
+#endif
+
 VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 VK_LAYER_RENDERDOC_Capture_layerGetPhysicalDeviceProcAddr(VkInstance instance, const char *pName)
 {
@@ -570,6 +941,14 @@ VK_LAYER_RENDERDOC_Capture_layerGetPhysicalDeviceProcAddr(VkInstance instance, c
     return NULL;
 
   HookInitVulkanInstance_PhysDev();
+
+#if ENABLED(RDOC_ANDROID)
+  {
+    PFN_vkVoidFunction passthrough = NULL;
+    if(instance != VK_NULL_HANDLE && ForeignInstancePassthrough(instance, pName, &passthrough))
+      return passthrough;
+  }
+#endif
 
 // any remaining functions that are known, we must return NULL for
 #undef HookInit
@@ -625,6 +1004,12 @@ VK_LAYER_RENDERDOC_Capture_layerGetPhysicalDeviceProcAddr(VkInstance instance, c
   // if we got here we don't recognise the function at all. Shouldn't be possible as we whitelist
   // extensions, but follow the spec and pass along
 
+#if ENABLED(RDOC_ANDROID)
+  // don't try to unwrap/query a foreign instance - this is not ours to touch
+  if(instance != VK_NULL_HANDLE && !WrappedVkInstance::IsAlloc(instance))
+    return NULL;
+#endif
+
   if(GetInstanceDispatchTable(instance)->GetInstanceProcAddr == NULL)
     return NULL;
 
@@ -644,6 +1029,21 @@ VK_LAYER_RENDERDOC_CaptureNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerI
 {
   if(pVersionStruct->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT)
     return VK_ERROR_INITIALIZATION_FAILED;
+
+#if ENABLED(RDOC_ANDROID)
+  // remember the chain's next proc addresses so we can forward foreign handles later (see
+  // ForeignInstancePassthrough above)
+  if(pVersionStruct->pfnGetInstanceProcAddr && pVersionStruct->pfnGetInstanceProcAddr !=
+                                                   VK_LAYER_RENDERDOC_CaptureGetInstanceProcAddr)
+    gchainGPA = pVersionStruct->pfnGetInstanceProcAddr;
+  if(pVersionStruct->pfnGetDeviceProcAddr &&
+     pVersionStruct->pfnGetDeviceProcAddr != VK_LAYER_RENDERDOC_CaptureGetDeviceProcAddr)
+    gchainGDPA = pVersionStruct->pfnGetDeviceProcAddr;
+
+  // the loader only negotiates with us when it is activating us as a layer - record that so the
+  // PLT hook filters know the loader chain is handling the wrapping (see RDCAndroidVKCaptureMode)
+  gAndroidVKLayerActive = true;
+#endif
 
   if(pVersionStruct->loaderLayerInterfaceVersion >= 2)
   {

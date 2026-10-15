@@ -450,6 +450,12 @@ static void DisguiseLinkMapEntry()
 // our text section would kill it with SIGILL.
 __attribute__((constructor)) static void InitLibraryHide()
 {
+  // The wrapper script sets LD_PRELOAD to get us loaded, and the environment survives into the
+  // app's image. Security SDKs (e.g. NetEase ntunisdk) read their own environment and flag a
+  // non-empty LD_PRELOAD immediately - we're already loaded by now, so scrub it before any app
+  // code (or its anti-tamper modules) gets to run.
+  unsetenv("LD_PRELOAD");
+
   HideLibraryFromMaps();
   DisguiseLinkMapEntry();
 }

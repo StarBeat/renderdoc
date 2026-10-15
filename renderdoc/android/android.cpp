@@ -644,6 +644,77 @@ bool RemoveRenderDocAndroidServer(const rdcstr &deviceID)
 // can remove its wrap property when the device session ends
 static rdcstr g_lastWrapPackage;
 
+// resolves the numeric uid that owns the app's data directory from the package manager. Only used
+// for logging which app the files were staged for, since SELinux denies chown on app_data_file
+// even to a KernelSU root shell.
+static rdcstr GetPackageUID(const rdcstr &deviceID, const rdcstr &packageName)
+{
+  Process::ProcessResult res =
+      adbExecCommand(deviceID, "shell pm list packages -U --user 0 " + packageName, ".", true);
+
+  int idx = res.strStdout.find("uid:");
+  if(idx < 0)
+    return rdcstr();
+
+  rdcstr uid = res.strStdout.substr(idx + 4).trimmed();
+
+  // strip any trailing non-numeric garbage (newlines, secondary user entries)
+  for(size_t i = 0; i < uid.size(); i++)
+  {
+    if(uid[i] < '0' || uid[i] > '9')
+    {
+      uid.resize(i);
+      break;
+    }
+  }
+
+  return uid;
+}
+
+// copies a staged file into the target app's data directory. run-as only works for debuggable
+// apps, which release games typically aren't - when it fails and a su root shell is available
+// (KernelSU/Magisk su works from adb shell even on production builds where 'adb root' fails),
+// copy as root and rely on world permissions for the app to access the file. SELinux denies
+// chown on app_data_file even to the ksu domain, so re-owning to the app uid is not possible -
+// 644/755 with the inherited app_data_file label is sufficient for both dlopen (library) and
+// exec-through-zygote (wrap script).
+static bool CopyIntoAppData(const rdcstr &deviceID, const rdcstr &packageName, const rdcstr &src,
+                            const rdcstr &dst)
+{
+  Process::ProcessResult cp =
+      adbExecCommand(deviceID, "shell run-as " + packageName + " cp " + src + " " + dst, ".", true);
+
+  if(cp.strStderror.empty() && cp.retCode == 0)
+    return true;
+
+  // run each root operation as its own su invocation - KernelSU's su -c tokenises its argument in
+  // ways that mangle shell chains and quoted strings, so keep every command a single word list.
+  Process::ProcessResult cpRoot =
+      adbExecCommand(deviceID, "shell su -c \"cp " + src + " " + dst + "\"", ".", true);
+
+  if(!cpRoot.strStderror.empty() || cpRoot.retCode != 0)
+  {
+    RDCERR("Failed to copy %s into %s - run-as: %s, su: %s", src.c_str(), dst.c_str(),
+           cp.strStderror.trimmed().c_str(), cpRoot.strStderror.trimmed().c_str());
+    return false;
+  }
+
+  Process::ProcessResult chmodRoot =
+      adbExecCommand(deviceID, "shell su -c \"chmod 755 " + dst + "\"", ".", true);
+
+  if(!chmodRoot.strStderror.empty() || chmodRoot.retCode != 0)
+  {
+    RDCERR("Failed to chmod %s via root shell: %s", dst.c_str(),
+           chmodRoot.strStderror.trimmed().c_str());
+    return false;
+  }
+
+  rdcstr uid = GetPackageUID(deviceID, packageName);
+  RDCLOG("Copied %s into app data via root shell, world-executable (app uid %s)", dst.c_str(),
+         uid.empty() ? "?" : uid.c_str());
+  return true;
+}
+
 // wrap.sh + LD_PRELOAD injection. The capture library lives in the renderdoc package's lib dir
 // which the target app's uid can't read, and /data/local/tmp files aren't executable by apps
 // under SELinux, so we stage the library and a wrapper script through the device shell into the
@@ -670,8 +741,19 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
   const rdcstr stageDir = "/data/local/tmp/rdwrap";
   const rdcstr appDataDir = "/data/user/0/" + packageName;
 
-  // export the library from the server package into a shell-readable staging directory. The
-  // redirection is performed by the device shell, so the output file is owned by the shell uid.
+  // The capture library must be loadable both as the LD_PRELOAD entry (phase 2 wrap.sh
+  // injection) and as the vulkan debug layer (phase 1 gpu_debug_layers_gles). If those resolve
+  // to two different file paths the library is mapped twice and the two copies keep separate
+  // static state - wrapped handles from one copy are foreign to the other, which crashes the
+  // vulkan loader dispatch. The vulkan loader searches (in order) the app data dir and the
+  // app's nativeLibraryDir, and looks there for libVkLayer_<layer>.so. We therefore stage the
+  // library into the app's nativeLibraryDir under the layer name and point LD_PRELOAD at that
+  // exact same path, so the linker loads it once.
+  rdcstr nativeLibDir = GetPathForPackage(deviceID, packageName) + "/lib/" + abiDir;
+  // the layer file name is the vulkan layer name with the VK_LAYER_ prefix stripped and the
+  // libVkLayer_ android prefix added: VK_LAYER_RENDERDOC_Capture -> libVkLayer_RENDERDOC_Capture.so
+  const rdcstr layerLibName = "libVkLayer_RENDERDOC_Capture.so";
+
   adbExecCommand(deviceID, "shell rm -rf " + stageDir, ".", true);
   adbExecCommand(deviceID, "shell mkdir -p " + stageDir, ".", true);
   adbExecCommand(deviceID, "shell chmod 755 " + stageDir, ".", true);
@@ -684,26 +766,69 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
 
   if(!cat.strStderror.empty() || cat.retCode != 0)
   {
-    RDCERR("Failed to export %s from %s: %s", RENDERDOC_ANDROID_LIBRARY, serverPkg.c_str(),
-           cat.strStderror.trimmed().c_str());
-    return RDResult(ResultCode::InjectionFailed,
-                    "Failed to stage the capture library for wrap injection.");
+    // the server APK may not be debuggable (run-as refused) - retry through a root shell if one
+    // is available, so wrap injection also works when neither the server nor the target APK is
+    // debuggable.
+    Process::ProcessResult catRoot = adbExecCommand(
+        deviceID,
+        "shell su -c \"cat " + serverLib + " > " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY +
+            "\"",
+        ".", true, kAdbLongCommandTimeoutMS);
+
+    if(!catRoot.strStderror.empty() || catRoot.retCode != 0)
+    {
+      RDCERR("Failed to export %s from %s: %s", RENDERDOC_ANDROID_LIBRARY, serverPkg.c_str(),
+             cat.strStderror.trimmed().c_str());
+      return RDResult(ResultCode::InjectionFailed,
+                      "Failed to stage the capture library for wrap injection.");
+    }
   }
 
   adbExecCommand(deviceID, "shell chmod 644 " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY, ".",
                  true);
 
-  // copy the library into the app's own data directory, as the app's uid so it can dlopen it
-  Process::ProcessResult cp = adbExecCommand(
-      deviceID,
-      "shell run-as " + packageName + " cp " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY + " " +
-          appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY,
-      ".", true);
-
-  if(!cp.strStderror.empty() || cp.retCode != 0)
+  // copy the library into the app's nativeLibraryDir under the vulkan layer file name, and
+  // point LD_PRELOAD at that exact path. The vulkan loader searches the nativeLibraryDir for
+  // libVkLayer_<name>.so and will find it there; because LD_PRELOAD already loaded that same
+  // path, the linker returns the existing (single) copy instead of mapping the library twice.
+  // run-as can't write into nativeLibraryDir (owned by system), so this needs a root shell;
+  // fall back to the legacy data-dir staging if root isn't available.
+  rdcstr preloadPath = appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY;
   {
-    RDCERR("Failed to copy %s into %s: %s", RENDERDOC_ANDROID_LIBRARY, appDataDir.c_str(),
-           cp.strStderror.trimmed().c_str());
+    Process::ProcessResult install = adbExecCommand(
+        deviceID,
+        "shell su -c \"cp " + stageDir + "/" + RENDERDOC_ANDROID_LIBRARY + " " + nativeLibDir +
+            "/" + layerLibName + " && chmod 755 " + nativeLibDir + "/" + layerLibName +
+            " && chcon u:object_r:apk_data_file:s0 " + nativeLibDir + "/" + layerLibName + "\"",
+        ".", true, kAdbLongCommandTimeoutMS);
+
+    if(install.retCode == 0 && !install.strStderror.contains("denied") &&
+       !install.strStderror.contains("not found"))
+    {
+      preloadPath = nativeLibDir + "/" + layerLibName;
+      // the data-dir copy of the layer is no longer needed - and it must NOT be present, or
+      // the loader would pick it up first (the data dir is searched before nativeLibraryDir)
+      // and map a second copy of the library.
+      adbExecCommand(deviceID,
+                     "shell su -c \"rm -f " + appDataDir + "/" + layerLibName + "\"",
+                     ".", true);
+      RDCLOG("Staged capture library as both preload and vulkan layer at %s",
+             preloadPath.c_str());
+    }
+    else
+    {
+      RDCLOG("Couldn't stage into nativeLibraryDir (%s) - keeping data-dir layer staging; "
+             "the vulkan layer may load as a second copy",
+             install.strStderror.trimmed().c_str());
+    }
+  }
+
+  // copy the library into the app's own data directory, as the app's uid so it can dlopen it.
+  // run-as only works for debuggable apps - on release builds this goes through a root shell
+  // when su is available.
+  if(!CopyIntoAppData(deviceID, packageName, stageDir + "/" + RENDERDOC_ANDROID_LIBRARY,
+                      appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY))
+  {
     return RDResult(ResultCode::InjectionFailed,
                     "Failed to copy the capture library into the application data directory.");
   }
@@ -715,11 +840,15 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
 
   // generate the wrap script on the host and stage it into the app's data directory the same way
   rdcstr script = "#!/system/bin/sh\n";
-  script += "export LD_PRELOAD=" + appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY + "\n";
+  script += "export LD_PRELOAD=" + preloadPath + "\n";
   script += "exec \"$@\"\n";
 
   rdcstr localScript = FileIO::GetTempFolderFilename() + "/rdwrap.sh";
-  FILE *f = FileIO::fopen(localScript, FileIO::WriteText);
+  // write in binary mode: on Windows, text mode would translate each '\n' into '\r\n' and the
+  // shebang line would become '#!/system/bin/sh\r'. The kernel then fails to find the interpreter
+  // '/system/bin/sh\r' and the wrapped process dies with exit code 126 before RenderDoc can
+  // attach ("Error reading pid from wrapped process" / injection failed).
+  FILE *f = FileIO::fopen(localScript, FileIO::WriteBinary);
   if(!f)
   {
     RDCERR("Couldn't write wrap script to %s", localScript.c_str());
@@ -733,7 +862,10 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
                      true, kAdbLongCommandTimeoutMS);
   FileIO::Delete(localScript);
 
-  if(!push.strStderror.empty() || push.retCode != 0)
+  // adb push reports its progress ("1 file pushed, 0 skipped. ...") on stderr even on success,
+  // so only a non-zero exit code or an explicit error string counts as failure.
+  if(push.retCode != 0 || push.strStderror.contains("error") ||
+     push.strStderror.contains("Permission denied"))
   {
     RDCERR("Failed to push wrap.sh: %s", push.strStderror.trimmed().c_str());
     return RDResult(ResultCode::InjectionFailed, "Failed to push the wrap.sh script.");
@@ -741,15 +873,8 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
 
   adbExecCommand(deviceID, "shell chmod 755 " + stageDir + "/wrap.sh", ".", true);
 
-  Process::ProcessResult cpScript = adbExecCommand(
-      deviceID,
-      "shell run-as " + packageName + " cp " + stageDir + "/wrap.sh " + appDataDir + "/rdwrap.sh",
-      ".", true);
-
-  if(!cpScript.strStderror.empty() || cpScript.retCode != 0)
+  if(!CopyIntoAppData(deviceID, packageName, stageDir + "/wrap.sh", appDataDir + "/rdwrap.sh"))
   {
-    RDCERR("Failed to copy wrap.sh into %s: %s", appDataDir.c_str(),
-           cpScript.strStderror.trimmed().c_str());
     return RDResult(ResultCode::InjectionFailed,
                     "Failed to copy the wrap.sh script into the application data directory.");
   }
@@ -757,9 +882,59 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
   adbExecCommand(deviceID, "shell run-as " + packageName + " chmod 755 " + appDataDir + "/rdwrap.sh",
                  ".", true);
 
-  adbExecCommand(deviceID,
-                 "shell setprop wrap." + packageName + " \"" + appDataDir + "/rdwrap.sh\"", ".",
-                 true);
+  Process::ProcessResult wrapSet = adbExecCommand(
+      deviceID,
+      "shell setprop wrap." + packageName + " \"" + appDataDir + "/rdwrap.sh\"", ".", true);
+
+  // some hardened ROMs (ColorOS among them) reject setting wrap.* properties entirely from the
+  // shell and app contexts. If a root shell is available (KernelSU/Magisk su works even where
+  // 'adb root' fails on production builds) set the property from the root context instead, and
+  // only fall back to JDWP injection when that fails too.
+  if(wrapSet.strStderror.contains("Failed to set property") || wrapSet.retCode != 0)
+  {
+    Process::ProcessResult wrapSetRoot = adbExecCommand(
+        deviceID,
+        "shell su -c \"setprop wrap." + packageName + " " + appDataDir + "/rdwrap.sh\"", ".",
+        true);
+
+    if(wrapSetRoot.strStderror.contains("Failed to set property") || wrapSetRoot.retCode != 0)
+    {
+      RDCERR("Failed to set wrap.%s: %s - the ROM blocks the wrap property and no root shell is "
+             "available, wrap injection is not possible on this device.",
+             packageName.c_str(), wrapSet.strStderror.trimmed().c_str());
+      return RDResult(ResultCode::InjectionFailed,
+                      "The device blocked setting the wrap property needed for preload injection.");
+    }
+
+    RDCLOG("wrap.%s set via root shell (the ROM blocks shell from writing wrap properties)",
+           packageName.c_str());
+  }
+
+  // Hardened-ROM fixups, best-effort through the root shell:
+  //
+  // * Android 14+ SELinux denies the app domain execute_no_trans on app_data_file, so a wrap
+  //   script staged in the app's own data directory never runs and the preloaded capture library
+  //   can't be dlopened. Re-labelling both files as shell_exec lets the app execute them exactly
+  //   the way it executes /system/bin/sh - allowed by the default policy, no sepolicy patch
+  //   needed and nothing to re-apply after a reboot.
+  // * The wrap exec-chain replaces the process image, which resets the linker namespaces the
+  //   zygote prepared. hwui's VulkanManager then fails to load libvulkan and aborts the process
+  //   ("Assertion failed: err < 0") when its render thread preloads a Vk context. Forcing hwui
+  //   to the OpenGL pipeline sidesteps that preload; the app's own renderer is unaffected.
+  const rdcstr fixups[] = {
+      "chcon u:object_r:shell_exec:s0 " + appDataDir + "/rdwrap.sh",
+      "chcon u:object_r:shell_exec:s0 " + appDataDir + "/" + RENDERDOC_ANDROID_LIBRARY,
+      "setprop debug.hwui.renderer opengl",
+  };
+
+  for(const rdcstr &fixup : fixups)
+  {
+    Process::ProcessResult res =
+        adbExecCommand(deviceID, "shell su -c \"" + fixup + "\"", ".", true);
+
+    if(res.retCode != 0 || res.strStderror.contains("Permission denied"))
+      RDCWARN("Root fixup '%s' failed: %s", fixup.c_str(), res.strStderror.trimmed().c_str());
+  }
 
   g_lastWrapPackage = packageName;
 
@@ -770,14 +945,20 @@ RDResult PrepareWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
 void ClearWrapInjection(const rdcstr &deviceID, const rdcstr &packageName)
 {
   Android::adbExecCommand(deviceID, "shell setprop wrap." + packageName + " \"\"", ".", true);
+
+  // On ROMs that block shell from writing wrap.* properties the set above fails silently (and a
+  // property that was set from a root context can't be cleared by shell either). Delete it via
+  // resetprop through a root shell if one is available - otherwise the property lingers until
+  // reboot and the app stays wrapped.
+  Android::adbExecCommand(deviceID,
+                          "shell su -c \"resetprop --delete wrap." + packageName + "\"", ".", true);
 }
 
 void ResetCaptureSettings(const rdcstr &deviceID)
 {
   if(!g_lastWrapPackage.empty())
   {
-    Android::adbExecCommand(deviceID, "shell setprop wrap." + g_lastWrapPackage + " \"\"", ".",
-                            true);
+    ClearWrapInjection(deviceID, g_lastWrapPackage);
     g_lastWrapPackage.clear();
   }
 
@@ -1898,7 +2079,15 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
                 m_deviceID, StringFormat::Fmt("shell am start -S -n %s/%s %s", packageName.c_str(),
                                               activityName.c_str(), intentArgs.c_str()));
 
-            Threading::Sleep(500);
+            Threading::Sleep(3000);
+
+            // The wrap property has done its job once the zygote has forked the wrapped process;
+            // from here on it only betrays the injection - security SDKs (e.g. NetEase ntunisdk)
+            // check wrap.<package> and abort when it is set. Remove it before the app's own code
+            // and anti-tamper modules initialise (which happens well after the fork).
+            Android::adbExecCommand(
+                m_deviceID,
+                "shell su -c \"resetprop --delete wrap." + packageName + "\"");
           }
           else
           {

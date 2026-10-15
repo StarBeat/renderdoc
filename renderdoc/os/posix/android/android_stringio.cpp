@@ -98,6 +98,26 @@ rdcstr FindFileInPath(const rdcstr &fileName)
 
 // For RenderDoc's apk, this returns our package name
 // For other APKs, we use it to get the writable temp directory.
+struct WrapPropSearch
+{
+  rdcstr package;
+};
+
+static void WrapPropForeach(const prop_info *pi, void *cookie)
+{
+  WrapPropSearch *search = (WrapPropSearch *)cookie;
+  char name[PROP_NAME_MAX];
+  char value[PROP_VALUE_MAX];
+
+  if(search->package.empty() && __system_property_read(pi, name, value) > 0 &&
+     !strncmp(name, "wrap.", 5) && value[0] != '\0')
+  {
+    // the wrap property is named wrap.<package> and holds the wrapper script path - the package
+    // part of the name is the application package of the process being wrapped
+    search->package = name + 5;
+  }
+}
+
 void GetExecutableFilename(rdcstr &selfName)
 {
   int fd = open(StringFormat::Fmt("/proc/%u/cmdline", getpid()).c_str(), O_RDONLY);
@@ -111,10 +131,48 @@ void GetExecutableFilename(rdcstr &selfName)
   {
     return;
   }
+  buf[len] = 0;
 
   // Strip any process name from cmdline (android:process)
   rdcstr cmdline = buf;
   rdcstr filename = cmdline.substr(0, cmdline.find(":"));
+
+  // When we are injected via a wrap.<package> script the process is re-exec'd through
+  // app_process64, so the cmdline no longer starts with the package name - it becomes the
+  // app_process64 executable path instead. That breaks the /sdcard/Android/media/<pkg>/files
+  // capture path, so recover the package name: the zygote keeps it in the --nice-name argument,
+  // and the wrap property that launched us is itself named after the package.
+  if(filename.empty() || filename[0] == '/' || filename.find('.') < 0)
+  {
+    rdcstr recovered;
+
+    // scan the NUL-separated argument list for --nice-name=<package>
+    const char *tok = buf;
+    while(tok < buf + len)
+    {
+      if(!strncmp(tok, "--nice-name=", strlen("--nice-name=")))
+      {
+        recovered = tok + strlen("--nice-name=");
+        break;
+      }
+      tok += strlen(tok) + 1;
+    }
+
+    if(recovered.empty())
+    {
+      WrapPropSearch search;
+      __system_property_foreach(&WrapPropForeach, &search);
+      recovered = search.package;
+    }
+
+    if(!recovered.empty())
+    {
+      RDCWARN("Recovered package name '%s' (cmdline was '%s')", recovered.c_str(),
+              filename.c_str());
+      filename = recovered;
+    }
+  }
+
   selfName = filename;
 }
 

@@ -37,6 +37,7 @@
 #include <link.h>
 #include <stddef.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 #include <algorithm>
 #include <map>
@@ -517,7 +518,139 @@ void process_dlopen(const char *filename, int flag)
 // below for why there is no dlopen here).
 static PFN_vkEnumerateInstanceLayerProperties Real_vkEnumerateInstanceLayerProperties = NULL;
 static PFN_vkGetInstanceProcAddr Real_vkGetInstanceProcAddr = NULL;
+static PFN_vkCreateInstance Real_vkCreateInstance = NULL;
+static PFN_vkCreateDevice Real_vkCreateDevice = NULL;
+static PFN_vkGetDeviceProcAddr Real_vkGetDeviceProcAddr = NULL;
 static void RegisterStealthHooks();
+
+// capture layer entry points exported by vk_layer.cpp for the no-layer (PLT) capture path. The
+// filters below call these to drive the same wrapping code the loader's layer chain normally
+// drives.
+extern "C" int RDCAndroidVKCaptureMode(void);
+extern "C" void RDCAndroidSetVKPLTMode(int active);
+extern "C" VkResult RDCAndroidPLTCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                                                const VkAllocationCallbacks *pAllocator,
+                                                VkInstance *pInstance);
+extern "C" VkResult RDCAndroidPLTCreateDevice(VkPhysicalDevice physicalDevice,
+                                              const VkDeviceCreateInfo *pCreateInfo,
+                                              const VkAllocationCallbacks *pAllocator,
+                                              VkDevice *pDevice);
+extern "C" PFN_vkVoidFunction RDCAndroidLayerGetInstanceProcAddr(VkInstance instance,
+                                                                 const char *pName);
+extern "C" PFN_vkVoidFunction RDCAndroidLayerGetDeviceProcAddr(VkDevice device, const char *pName);
+extern "C" VkInstance RDCAndroidInstanceRealHandle(VkInstance instance);
+extern "C" VkDevice RDCAndroidDeviceRealHandle(VkDevice device);
+
+// loader chain link structs - local mirrors of official/vk_layer.h (must match the loader ABI).
+// In the no-layer mode there is no loader layer chain to provide them, so the create filters
+// synthesize the link info the wrapping code expects before calling into vk_layer.cpp.
+typedef struct VkLayerInstanceLink_ {
+  struct VkLayerInstanceLink_ *pNext;
+  PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
+  PFN_vkVoidFunction(VKAPI_PTR *pfnNextGetPhysicalDeviceProcAddr)(VkInstance instance,
+                                                                  const char *pName);
+} VkLayerInstanceLink;
+
+typedef struct VkLayerDeviceLink_ {
+  struct VkLayerDeviceLink_ *pNext;
+  PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
+  PFN_vkGetDeviceProcAddr pfnNextGetDeviceProcAddr;
+} VkLayerDeviceLink;
+
+typedef enum VkLayerFunction_ {
+  VK_LAYER_LINK_INFO = 0,
+} VkLayerFunction;
+
+typedef struct VkLayerInstanceCreateInfo_ {
+  VkStructureType sType;    // VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
+  const void *pNext;
+  VkLayerFunction function;
+  union {
+    VkLayerInstanceLink *pLayerInfo;
+  } u;
+} VkLayerInstanceCreateInfo;
+
+typedef struct VkLayerDeviceCreateInfo_ {
+  VkStructureType sType;    // VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+  const void *pNext;
+  VkLayerFunction function;
+  union {
+    VkLayerDeviceLink *pLayerInfo;
+  } u;
+} VkLayerDeviceCreateInfo;
+
+// The host activates the loader's layer path via system properties (and the gpu_debug_*
+// settings, which can't be read from inside the app process). If any of the properties is set,
+// we must stay in layer mode even before negotiation with our own layer has happened
+// (negotiation occurs when the loader loads us during the first instance creation, which is
+// after the app has already made queries through these filters).
+static bool AndroidVKLayerSettingsActive()
+{
+  char value[PROP_VALUE_MAX];
+
+  // the host sets this when activating the loader's layer path
+  if(__system_property_get("debug.vulkan.layers", value) > 0 && value[0] != '\0' &&
+     strcmp(value, ":") != 0)
+    return true;
+
+  // some loaders read this one instead
+  if(__system_property_get("debug.vulkan.gpu_debug_layers", value) > 0 && value[0] != '\0')
+    return true;
+
+  return false;
+}
+
+// true while the loader is activating us as a layer (RDCAndroidVKCaptureMode() == 0) - in that
+// case the create filters must forward untouched so the loader inserts its own chain. When the
+// loader never negotiates with us and the debug-layer settings are off, the PLT path activates
+// the no-layer capture (mode 1).
+static bool AndroidVKPLTMode()
+{
+  if(RDCAndroidVKCaptureMode() < 0)
+  {
+    if(!AndroidVKLayerSettingsActive())
+      RDCAndroidSetVKPLTMode(1);
+  }
+  return RDCAndroidVKCaptureMode() > 0;
+}
+
+static void EnsureRealVulkanEntries()
+{
+  if(!Real_vkGetInstanceProcAddr)
+    Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
+  if(!Real_vkCreateInstance)
+    Real_vkCreateInstance = (PFN_vkCreateInstance)dlsym(RTLD_DEFAULT, "vkCreateInstance");
+  if(!Real_vkCreateDevice)
+    Real_vkCreateDevice = (PFN_vkCreateDevice)dlsym(RTLD_DEFAULT, "vkCreateDevice");
+  if(!Real_vkGetDeviceProcAddr)
+    Real_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)dlsym(RTLD_DEFAULT, "vkGetDeviceProcAddr");
+
+  // if the loader was loaded RTLD_LOCAL its symbols are not in the global scope - resolve
+  // through its handle instead. By this point the app has already made vulkan calls, so the
+  // loader is definitely loaded and this RTLD_NOLOAD dlopen is just a handle lookup.
+  if(!Real_vkGetInstanceProcAddr || !Real_vkCreateInstance || !Real_vkCreateDevice ||
+     !Real_vkGetDeviceProcAddr)
+  {
+    void *vulkanHandle = dlopen("libvulkan.so", RTLD_NOLOAD | RTLD_NOW);
+    if(vulkanHandle)
+    {
+      if(!Real_vkGetInstanceProcAddr)
+        Real_vkGetInstanceProcAddr =
+            (PFN_vkGetInstanceProcAddr)dlsym(vulkanHandle, "vkGetInstanceProcAddr");
+      if(!Real_vkCreateInstance)
+        Real_vkCreateInstance = (PFN_vkCreateInstance)dlsym(vulkanHandle, "vkCreateInstance");
+      if(!Real_vkCreateDevice)
+        Real_vkCreateDevice = (PFN_vkCreateDevice)dlsym(vulkanHandle, "vkCreateDevice");
+      if(!Real_vkGetDeviceProcAddr)
+        Real_vkGetDeviceProcAddr =
+            (PFN_vkGetDeviceProcAddr)dlsym(vulkanHandle, "vkGetDeviceProcAddr");
+    }
+  }
+
+  if(!Real_vkGetInstanceProcAddr || !Real_vkCreateInstance || !Real_vkCreateDevice ||
+     !Real_vkGetDeviceProcAddr)
+    RDCERR("Couldn't resolve the real vulkan loader entry points!");
+}
 
 // stealth: the filters below have to forward to the *real* loader entry points. Resolving them
 // with dlsym(RTLD_DEFAULT, ...) alone is not reliable: applications very commonly
@@ -535,8 +668,13 @@ static void RememberRealVulkanEntry(const char *name, void *func)
   if(name == NULL || func == NULL)
     return;
 
-  if(strcmp(name, "vkGetInstanceProcAddr") != 0 &&
-     strcmp(name, "vkEnumerateInstanceLayerProperties") != 0)
+  const bool isGIPA = (strcmp(name, "vkGetInstanceProcAddr") == 0);
+  const bool isEnumLayer = (strcmp(name, "vkEnumerateInstanceLayerProperties") == 0);
+  const bool isCreateInstance = (strcmp(name, "vkCreateInstance") == 0);
+  const bool isCreateDevice = (strcmp(name, "vkCreateDevice") == 0);
+  const bool isGDPA = (strcmp(name, "vkGetDeviceProcAddr") == 0);
+
+  if(!isGIPA && !isEnumLayer && !isCreateInstance && !isCreateDevice && !isGDPA)
     return;
 
   Dl_info info = {};
@@ -544,23 +682,30 @@ static void RememberRealVulkanEntry(const char *name, void *func)
      strstr(info.dli_fname, "libvulkan") == NULL)
     return;
 
-  if(strcmp(name, "vkGetInstanceProcAddr") == 0)
+  if(isGIPA && Real_vkGetInstanceProcAddr == NULL)
   {
-    if(Real_vkGetInstanceProcAddr == NULL)
-    {
-      Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)func;
-      // RDCLOG rather than HOOK_DEBUG_PRINT: this happens at most once and confirms from the
-      // device log that the filter has a real target to forward to.
-      RDCLOG("Captured real vkGetInstanceProcAddr %p from %s", func, info.dli_fname);
-    }
+    Real_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)func;
+    RDCLOG("Captured real vkGetInstanceProcAddr %p from %s", func, info.dli_fname);
   }
-  else
+  else if(isEnumLayer && Real_vkEnumerateInstanceLayerProperties == NULL)
   {
-    if(Real_vkEnumerateInstanceLayerProperties == NULL)
-    {
-      Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)func;
-      RDCLOG("Captured real vkEnumerateInstanceLayerProperties %p from %s", func, info.dli_fname);
-    }
+    Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)func;
+    RDCLOG("Captured real vkEnumerateInstanceLayerProperties %p from %s", func, info.dli_fname);
+  }
+  else if(isCreateInstance && Real_vkCreateInstance == NULL)
+  {
+    Real_vkCreateInstance = (PFN_vkCreateInstance)func;
+    RDCLOG("Captured real vkCreateInstance %p from %s", func, info.dli_fname);
+  }
+  else if(isCreateDevice && Real_vkCreateDevice == NULL)
+  {
+    Real_vkCreateDevice = (PFN_vkCreateDevice)func;
+    RDCLOG("Captured real vkCreateDevice %p from %s", func, info.dli_fname);
+  }
+  else if(isGDPA && Real_vkGetDeviceProcAddr == NULL)
+  {
+    Real_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)func;
+    RDCLOG("Captured real vkGetDeviceProcAddr %p from %s", func, info.dli_fname);
   }
 }
 
@@ -665,11 +810,13 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlsym(void *handl
   if(!strcmp(symbol, "dlvsym"))
     return (void *)&hooked_dlvsym;
 
-  // stealth: if the app resolves the vulkan loader's enumeration entry points via dlsym
-  // (bypassing the PLT hooks), give it the filtered versions so our layer name stays hidden.
+  // stealth/no-layer capture: if the app resolves the vulkan loader's entry points via dlsym
+  // (bypassing the PLT hooks), give it the filtered versions. The create/device-proc filters
+  // forward untouched in layer mode and drive the no-layer capture in PLT mode.
   if(info.dli_fname && strstr(info.dli_fname, "libvulkan") &&
      (!strcmp(symbol, "vkEnumerateInstanceLayerProperties") ||
-      !strcmp(symbol, "vkGetInstanceProcAddr")))
+      !strcmp(symbol, "vkGetInstanceProcAddr") || !strcmp(symbol, "vkCreateInstance") ||
+      !strcmp(symbol, "vkCreateDevice") || !strcmp(symbol, "vkGetDeviceProcAddr")))
   {
     HOOK_DEBUG_PRINT("returning filtered %s for dlsym in %s", symbol, info.dli_fname);
     // remember the real entry point we are standing in front of - this is the resolution the
@@ -720,10 +867,12 @@ extern "C" __attribute__((visibility("default"))) void *hooked_dlvsym(void *hand
   dladdr(ret, &info);
   HOOK_DEBUG_PRINT("real ret is %p in %s", ret, info.dli_fname);
 
-  // stealth: same filtering as hooked_dlsym, for apps that use the versioned lookup instead
+  // stealth/no-layer capture: same filtering as hooked_dlsym, for apps that use the versioned
+  // lookup instead
   if(info.dli_fname && strstr(info.dli_fname, "libvulkan") &&
      (!strcmp(symbol, "vkEnumerateInstanceLayerProperties") ||
-      !strcmp(symbol, "vkGetInstanceProcAddr")))
+      !strcmp(symbol, "vkGetInstanceProcAddr") || !strcmp(symbol, "vkCreateInstance") ||
+      !strcmp(symbol, "vkCreateDevice") || !strcmp(symbol, "vkGetDeviceProcAddr")))
   {
     HOOK_DEBUG_PRINT("returning filtered %s for dlvsym in %s", symbol, info.dli_fname);
     RememberRealVulkanEntry(symbol, ret);
@@ -1031,9 +1180,157 @@ static VkResult VKAPI_PTR Filtered_vkEnumerateInstanceLayerProperties(
   return (filteredCount > requested) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+// no-layer capture path: vkCreateInstance. When the loader is chaining us as a layer the call
+// must be forwarded untouched (the loader inserts its own layer chain), otherwise we synthesize
+// the loader link info and drive the wrapping code in vk_layer.cpp directly.
+static VkResult VKAPI_PTR Filtered_vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                                                    const VkAllocationCallbacks *pAllocator,
+                                                    VkInstance *pInstance)
+{
+  if(!AndroidVKPLTMode())
+  {
+    // layer mode - forward untouched, the loader adds our layer to the chain itself
+    if(!Real_vkCreateInstance)
+      EnsureRealVulkanEntries();
+    if(!Real_vkCreateInstance)
+      return VK_ERROR_INITIALIZATION_FAILED;
+    return Real_vkCreateInstance(pCreateInfo, pAllocator, pInstance);
+  }
+
+  // no-layer mode - synthesize the loader link info the wrapping code requires (there is no
+  // layer chain to provide one) and wrap through the capture layer
+  if(!Real_vkGetInstanceProcAddr)
+    EnsureRealVulkanEntries();
+  if(!Real_vkGetInstanceProcAddr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  VkLayerInstanceLink linkInfo = {};
+  linkInfo.pNext = NULL;
+  linkInfo.pfnNextGetInstanceProcAddr = Real_vkGetInstanceProcAddr;
+  linkInfo.pfnNextGetPhysicalDeviceProcAddr = NULL;
+
+  VkLayerInstanceCreateInfo linkCreateInfo = {};
+  linkCreateInfo.sType = VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO;
+  linkCreateInfo.pNext = NULL;
+  linkCreateInfo.function = VK_LAYER_LINK_INFO;
+  linkCreateInfo.u.pLayerInfo = &linkInfo;
+
+  VkInstanceCreateInfo modifiedCreateInfo = *pCreateInfo;
+  // the wrapping code advances through the link's pNext when passing the chain down, so the link
+  // must carry the original pNext chain
+  linkInfo.pNext = (VkLayerInstanceLink *)modifiedCreateInfo.pNext;
+  modifiedCreateInfo.pNext = &linkCreateInfo;
+
+  return RDCAndroidPLTCreateInstance(&modifiedCreateInfo, pAllocator, pInstance);
+}
+
+// no-layer capture path: vkCreateDevice. Same split as the instance create: in layer mode the
+// loader provides the device link info, in no-layer mode we synthesize it.
+static VkResult VKAPI_PTR Filtered_vkCreateDevice(VkPhysicalDevice physicalDevice,
+                                                  const VkDeviceCreateInfo *pCreateInfo,
+                                                  const VkAllocationCallbacks *pAllocator,
+                                                  VkDevice *pDevice)
+{
+  if(!AndroidVKPLTMode())
+  {
+    if(!Real_vkCreateDevice)
+      EnsureRealVulkanEntries();
+    if(!Real_vkCreateDevice)
+      return VK_ERROR_INITIALIZATION_FAILED;
+    return Real_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+  }
+
+  if(!Real_vkGetInstanceProcAddr || !Real_vkGetDeviceProcAddr)
+    EnsureRealVulkanEntries();
+  if(!Real_vkGetInstanceProcAddr || !Real_vkGetDeviceProcAddr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  VkLayerDeviceLink linkInfo = {};
+  linkInfo.pNext = NULL;
+  linkInfo.pfnNextGetInstanceProcAddr = Real_vkGetInstanceProcAddr;
+  linkInfo.pfnNextGetDeviceProcAddr = Real_vkGetDeviceProcAddr;
+
+  VkLayerDeviceCreateInfo linkCreateInfo = {};
+  linkCreateInfo.sType = VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO;
+  linkCreateInfo.pNext = NULL;
+  linkCreateInfo.function = VK_LAYER_LINK_INFO;
+  linkCreateInfo.u.pLayerInfo = &linkInfo;
+
+  VkDeviceCreateInfo modifiedCreateInfo = *pCreateInfo;
+  linkInfo.pNext = (VkLayerDeviceLink *)modifiedCreateInfo.pNext;
+  modifiedCreateInfo.pNext = &linkCreateInfo;
+
+  return RDCAndroidPLTCreateDevice(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
+}
+
+// no-layer capture path: vkGetDeviceProcAddr. The capture layer's GDPA returns NULL for anything
+// it doesn't hook (the loader normally falls through to the ICD in that case) - here we forward
+// those NULLs to the real loader ourselves with the real device handle.
+static PFN_vkVoidFunction VKAPI_PTR Filtered_vkGetDeviceProcAddr(VkDevice device, const char *pName)
+{
+  if(pName && !strcmp(pName, "vkGetDeviceProcAddr"))
+    return (PFN_vkVoidFunction)&Filtered_vkGetDeviceProcAddr;
+
+  if(AndroidVKPLTMode())
+  {
+    PFN_vkVoidFunction fn = RDCAndroidLayerGetDeviceProcAddr(device, pName);
+    if(fn)
+      return fn;
+  }
+
+  if(!Real_vkGetDeviceProcAddr)
+    EnsureRealVulkanEntries();
+  if(!Real_vkGetDeviceProcAddr)
+    return NULL;
+
+  return Real_vkGetDeviceProcAddr(RDCAndroidDeviceRealHandle(device), pName);
+}
+
 static PFN_vkVoidFunction VKAPI_PTR Filtered_vkGetInstanceProcAddr(VkInstance instance,
                                                                    const char *pName)
 {
+  if(pName && AndroidVKPLTMode())
+  {
+    // entry points that only make sense coming from us on the no-layer capture path - engines
+    // cache these and call them directly, so they must be our filters (which synthesize the
+    // loader chain link info the wrapping code expects)
+    if(!strcmp(pName, "vkGetDeviceProcAddr"))
+      return (PFN_vkVoidFunction)&Filtered_vkGetDeviceProcAddr;
+    if(!strcmp(pName, "vkCreateDevice"))
+      return (PFN_vkVoidFunction)&Filtered_vkCreateDevice;
+
+    if(instance == VK_NULL_HANDLE)
+    {
+      if(!strcmp(pName, "vkEnumerateInstanceLayerProperties"))
+        return (PFN_vkVoidFunction)&Filtered_vkEnumerateInstanceLayerProperties;
+
+      if(!strcmp(pName, "vkGetInstanceProcAddr"))
+        return (PFN_vkVoidFunction)&Filtered_vkGetInstanceProcAddr;
+
+      if(!strcmp(pName, "vkCreateInstance"))
+        return (PFN_vkVoidFunction)&Filtered_vkCreateInstance;
+
+      // every other NULL-instance query is a global loader query - forward it
+      if(!Real_vkGetInstanceProcAddr)
+        EnsureRealVulkanEntries();
+      if(!Real_vkGetInstanceProcAddr)
+        return NULL;
+      return Real_vkGetInstanceProcAddr(VK_NULL_HANDLE, pName);
+    }
+
+    // wrapped instance: let the capture layer answer, then fall back to the real loader with the
+    // real handle for anything we don't hook (or any instance we never wrapped)
+    PFN_vkVoidFunction fn = RDCAndroidLayerGetInstanceProcAddr(instance, pName);
+    if(fn)
+      return fn;
+
+    if(!Real_vkGetInstanceProcAddr)
+      EnsureRealVulkanEntries();
+    if(!Real_vkGetInstanceProcAddr)
+      return NULL;
+    return Real_vkGetInstanceProcAddr(RDCAndroidInstanceRealHandle(instance), pName);
+  }
+
   if(instance == VK_NULL_HANDLE && pName)
   {
     if(!strcmp(pName, "vkEnumerateInstanceLayerProperties"))
@@ -1064,27 +1361,44 @@ static void RegisterStealthHooks()
   static bool registered = false;
   if(!registered)
   {
-    RDCLOG("Registering stealth hooks to hide " RENDERDOC_VULKAN_LAYER_NAME " from enumeration");
+    RDCLOG("Registering stealth hooks to hide " RENDERDOC_VULKAN_LAYER_NAME
+           " from enumeration and drive the no-layer capture path");
 
     LibraryHooks::RegisterFunctionHook(
         "libvulkan.so", FunctionHook("vkEnumerateInstanceLayerProperties", NULL,
                                      (void *)&Filtered_vkEnumerateInstanceLayerProperties));
     LibraryHooks::RegisterFunctionHook("libvulkan.so", FunctionHook("vkGetInstanceProcAddr", NULL,
                                                                     (void *)&Filtered_vkGetInstanceProcAddr));
+    LibraryHooks::RegisterFunctionHook(
+        "libvulkan.so", FunctionHook("vkCreateInstance", NULL, (void *)&Filtered_vkCreateInstance));
+    LibraryHooks::RegisterFunctionHook(
+        "libvulkan.so", FunctionHook("vkCreateDevice", NULL, (void *)&Filtered_vkCreateDevice));
+    LibraryHooks::RegisterFunctionHook("libvulkan.so", FunctionHook("vkGetDeviceProcAddr", NULL,
+                                                                    (void *)&Filtered_vkGetDeviceProcAddr));
     registered = true;
   }
 
-  if(Real_vkGetInstanceProcAddr)
+  if(Real_vkGetInstanceProcAddr && Real_vkCreateInstance && Real_vkCreateDevice &&
+     Real_vkGetDeviceProcAddr)
     return;
 
   // resolve the real entry points with dlsym only - the vulkan loader must already be loaded
   // for this to work, so no dlopen (an explicit dlopen of libvulkan at init time is an extra
   // hazard in anti-cheat processes; see the note in EndHookRegistration). If it isn't loaded
-  // yet this is retried from hooked_dlopen when a libvulkan library is loaded.
-  Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)dlsym(
-      RTLD_DEFAULT, "vkEnumerateInstanceLayerProperties");
-  Real_vkGetInstanceProcAddr =
-      (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
+  // yet this is retried from hooked_dlopen when a libvulkan library is loaded, and the filters
+  // themselves fall back on EnsureRealVulkanEntries before first use.
+  if(!Real_vkEnumerateInstanceLayerProperties)
+    Real_vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)dlsym(
+        RTLD_DEFAULT, "vkEnumerateInstanceLayerProperties");
+  if(!Real_vkGetInstanceProcAddr)
+    Real_vkGetInstanceProcAddr =
+        (PFN_vkGetInstanceProcAddr)dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr");
+  if(!Real_vkCreateInstance)
+    Real_vkCreateInstance = (PFN_vkCreateInstance)dlsym(RTLD_DEFAULT, "vkCreateInstance");
+  if(!Real_vkCreateDevice)
+    Real_vkCreateDevice = (PFN_vkCreateDevice)dlsym(RTLD_DEFAULT, "vkCreateDevice");
+  if(!Real_vkGetDeviceProcAddr)
+    Real_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)dlsym(RTLD_DEFAULT, "vkGetDeviceProcAddr");
 }
 
 void LibraryHooks::EndHookRegistration()

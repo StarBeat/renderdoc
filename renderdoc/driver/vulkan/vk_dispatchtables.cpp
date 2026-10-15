@@ -269,7 +269,48 @@ VkDevDispatchTable *GetDeviceDispatchTable(void *device)
     auto it = devlookup.find(key);
 
     if(it == devlookup.end())
+    {
+#if ENABLED(RDOC_ANDROID)
+      // see GetInstanceDispatchTable - an unknown device from a foreign instance (hwui) is
+      // forwarded to the real driver rather than aborting.
+      static VkDevDispatchTable passthroughTable;
+      static bool passthroughInit = false;
+
+      if(!passthroughInit)
+      {
+        passthroughInit = true;
+
+        PFN_vkGetDeviceProcAddr realGDPA = NULL;
+        PFN_vkGetInstanceProcAddr realGPA =
+            (PFN_vkGetInstanceProcAddr)Process::GetFunctionAddress(
+                Process::LoadModule("libvulkan.so"), "vkGetInstanceProcAddr");
+
+        if(realGPA)
+          realGDPA = (PFN_vkGetDeviceProcAddr)realGPA(VK_NULL_HANDLE, "vkGetDeviceProcAddr");
+
+        if(realGDPA)
+        {
+          VkDevDispatchTable &table = passthroughTable;
+          memset(&table, 0, sizeof(table));
+
+          table.GetDeviceProcAddr = realGDPA;
+
+#undef HookInit
+#define HookInit(name)                                              \
+  if(table.name == NULL && device)                                  \
+    table.name = (CONCAT(PFN_vk, name))realGDPA((VkDevice)device,   \
+                                                STRINGIZE(CONCAT(vk, name)));
+
+          HookInitVulkanDevice();
+        }
+      }
+
+      if(passthroughTable.GetDeviceProcAddr)
+        return &passthroughTable;
+#endif
+
       RDCFATAL("Bad device pointer");
+    }
 
     return &it->second;
   }
@@ -288,7 +329,61 @@ VkInstDispatchTable *GetInstanceDispatchTable(void *instance)
     auto it = instlookup.find(key);
 
     if(it == instlookup.end())
+    {
+#if ENABLED(RDOC_ANDROID)
+      // On some devices hwui creates its own VkInstance that is handed to our layer's
+      // GetInstanceProcAddr and WSI hooks without having gone through hooked_vkCreateInstance
+      // (an instance created before the debug layer was active in that loader, or through a
+      // second libvulkan handle). Aborting here kills the whole app process. Degrade
+      // gracefully instead: build a pass-through dispatch table from the real loader's
+      // vkGetInstanceProcAddr so the calls are forwarded unintercepted. This instance is not
+      // being captured, only hwui's UI composition.
+      static VkInstDispatchTable passthroughTable;
+      static bool passthroughInit = false;
+
+      if(!passthroughInit)
+      {
+        passthroughInit = true;
+
+        PFN_vkGetInstanceProcAddr realGPA =
+            (PFN_vkGetInstanceProcAddr)Process::GetFunctionAddress(
+                Process::LoadModule("libvulkan.so"), "vkGetInstanceProcAddr");
+
+        if(realGPA)
+        {
+          VkInstDispatchTable &table = passthroughTable;
+          memset(&table, 0, sizeof(table));
+
+          table.GetInstanceProcAddr = realGPA;
+
+#undef HookInit
+#define HookInit(name)                                                \
+  if(table.name == NULL && instance)                                  \
+    table.name = (CONCAT(PFN_vk, name))realGPA((VkInstance)instance, \
+                                               STRINGIZE(CONCAT(vk, name)));
+
+          HookInitVulkanInstance();
+        }
+      }
+
+      if(passthroughTable.GetInstanceProcAddr)
+      {
+        static bool warned = false;
+        if(!warned)
+        {
+          warned = true;
+          RDCLOG(
+              "Unknown Vulkan instance %p passed to our hooks (hwui/second loader?). Forwarding "
+              "calls to the real loader unintercepted instead of aborting.",
+              instance);
+        }
+
+        return &passthroughTable;
+      }
+#endif
+
       RDCFATAL("Bad device pointer");
+    }
 
     return &it->second;
   }

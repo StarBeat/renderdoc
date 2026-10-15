@@ -604,6 +604,16 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   // move chain on for next layer
   layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
 
+#if ENABLED(RDOC_ANDROID)
+  {
+    // remember the chain's next GetInstanceProcAddr so that foreign (loader-internal) handles
+    // arriving at our layer's GetInstanceProcAddr can be forwarded down the chain instead of
+    // crashing - see ForeignInstancePassthrough in vk_layer.cpp
+    extern PFN_vkGetInstanceProcAddr gchainGPA_capture;
+    gchainGPA_capture = gpa;
+  }
+#endif
+
   PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance)gpa(VK_NULL_HANDLE, "vkCreateInstance");
 
   VkInstanceCreateInfo modifiedCreateInfo;
@@ -834,7 +844,20 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
   InitInstanceTable(m_Instance, gpa);
 
+#if ENABLED(RDOC_ANDROID)
+  {
+    // Remember the mapping from the loader-internal instance handle to our wrapped handle.
+    // On some Android loaders the app-facing vkGetInstanceProcAddr dispatches to layers with
+    // the loader-internal handle rather than the wrapped handle we returned, so we need this
+    // to translate back - see ForeignInstancePassthrough in vk_layer.cpp.
+    extern void RDCLayerHookedInstanceCreated(void *loaderHandle, void *wrappedHandle);
+    void *loaderHandle = (void *)m_Instance;
+    GetResourceManager()->WrapResource(ResourceId(), m_Instance, m_Instance);
+    RDCLayerHookedInstanceCreated(loaderHandle, (void *)m_Instance);
+  }
+#else
   GetResourceManager()->WrapResource(ResourceId(), m_Instance, m_Instance);
+#endif
 
   *pInstance = m_Instance;
 

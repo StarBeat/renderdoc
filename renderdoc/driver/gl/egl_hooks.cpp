@@ -154,19 +154,85 @@ public:
 // of our hooks can be called
 static void EnsureRealLibraryLoaded()
 {
-#if ENABLED(RDOC_LINUX)
+#if ENABLED(RDOC_LINUX) || ENABLED(RDOC_ANDROID)
   if(eglhook.handle == DEFAULT_HANDLE)
   {
     if(!RenderDoc::Inst().IsReplayApp())
       RDCLOG("Loading libEGL at the last second");
 
+#if ENABLED(RDOC_ANDROID)
+    void *handle = Process::LoadModule("libEGL.so");
+#else
     void *handle = Process::LoadModule("libEGL.so.1");
 
     if(!handle)
       handle = Process::LoadModule("libEGL.so");
+#endif
 
     if(RenderDoc::Inst().IsReplayApp())
       eglhook.handle = handle;
+  }
+#endif
+
+#if ENABLED(RDOC_ANDROID)
+  // On Android our library can sit in front of the real libEGL in the global symbol scope - either
+  // because it was LD_PRELOADed (wrap.sh injection) or because the GLES layer loader loaded it
+  // early. Any library that lazily binds an EGL symbol (like libhwui calling eglGetDisplay during
+  // ZygoteInit.preload) then lands in one of our exported stubs. If the dispatch table wasn't
+  // filled yet - hooks disabled because EGL_ANDROID_GLES_layers is present, or the layer
+  // protocol hasn't initialised us yet - calling onward would be a NULL dereference and kill the
+  // process. Fill any still-missing pointers from the real libEGL so the stubs can always
+  // forward. Pointers already set by the layer protocol or by hooking are left untouched.
+  {
+    static bool populated = false;
+
+    if(!populated)
+    {
+      populated = true;
+
+      // resolve the real libEGL handle: the one we may have loaded above, or RTLD_NEXT which
+      // finds the next libEGL after ourselves in the global scope.
+      void *handle = (eglhook.handle != DEFAULT_HANDLE) ? eglhook.handle : (void *)RTLD_NEXT;
+
+      bool wasMissing = false;
+
+#define EGL_FILL(func, isext, replayrequired)                                                     \
+  if(!EGL.func)                                                                                   \
+  {                                                                                               \
+    EGL.func = (CONCAT(PFN_egl, func))Process::GetFunctionAddress(handle, "egl" STRINGIZE(func)); \
+    if(!EGL.func && CheckConstParam(isext))                                                       \
+      EGL.func = (CONCAT(PFN_egl, func))dlsym((void *)RTLD_NEXT, "egl" STRINGIZE(func));          \
+    if(EGL.func)                                                                                  \
+      wasMissing = true;                                                                          \
+  }
+      EGL_HOOKED_SYMBOLS(EGL_FILL)
+      EGL_NONHOOKED_SYMBOLS(EGL_FILL)
+#undef EGL_FILL
+
+      if(wasMissing && !RenderDoc::Inst().IsReplayApp())
+        RDCLOG(
+            "Populated missing EGL dispatch entries from the real libEGL before the layer or "
+            "hooks were initialised");
+
+      // The GL dispatch table is normally filled from the EGLHooked callback (when library hooks
+      // are active) or from AndroidGLESLayer_Initialize (when the GLES layer protocol engages).
+      // With hooks disabled due to EGL_ANDROID_GLES_layers, but our library still sitting in
+      // front of libEGL via LD_PRELOAD/wrap.sh symbol interposition, neither runs and any use of
+      // a GL.* function pointer would be a call through NULL. Fill the table now via
+      // eglGetProcAddress against the real libEGL, leaving any existing pointers untouched.
+      if(GL.glGetString == NULL && EGL.GetProcAddress)
+      {
+        if(!RenderDoc::Inst().IsReplayApp())
+          RDCLOG("Populating GL dispatch table from the real libEGL via eglGetProcAddress");
+
+        GL.PopulateWithCallback([](const char *funcName) {
+          // on some android devices we need to hook dlsym, but eglGetProcAddress might call dlsym
+          // so we need to ensure we return the 'real' pointers
+          ScopedSuppressHooking suppress;
+          return (void *)EGL.GetProcAddress(funcName);
+        });
+      }
+    }
   }
 #endif
 }
