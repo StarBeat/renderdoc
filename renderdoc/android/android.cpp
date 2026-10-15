@@ -1722,7 +1722,39 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
 
     rdcstr info;
 
-    if(Android::SupportsNativeLayers(m_deviceID))
+    rdcstr installedPath = Android::GetPathForPackage(m_deviceID, packageName);
+
+    rdcstr RDCLib = Android::adbExecCommand(m_deviceID, "shell ls " + installedPath +
+                                                            "/lib/*/" RENDERDOC_ANDROID_LIBRARY)
+                        .strStdout.trimmed();
+
+    if(Android_Debug_ProcessLaunch())
+    {
+      RDCLOG("Checking for existing library, found '%s'", RDCLib.c_str());
+    }
+    // some versions of adb/android return the error message on stdout, so try to detect those and
+    // clear the output.
+    if(RDCLib.size() < installedPath.size() || RDCLib.substr(0, installedPath.size()) != installedPath)
+      RDCLib.clear();
+
+    // some versions of adb/android also don't print any error message at all! Look to see if the
+    // wildcard glob is still present.
+    if(RDCLib.find("/lib/*/" RENDERDOC_ANDROID_LIBRARY) >= 0)
+      RDCLib.clear();
+
+    if(RDCLib.empty())
+    {
+      RDCLOG("No library found in %s/lib/*/" RENDERDOC_ANDROID_LIBRARY
+             " for %s - assuming injection is required.",
+             installedPath.c_str(), packageName.c_str());
+    }
+    else
+    {
+      hookWithJDWP = false;
+      RDCLOG("Library found, no injection required: %s", RDCLib.c_str());
+    }
+
+    if(RDCLib.empty() && Android::SupportsNativeLayers(m_deviceID))
     {
       RDCLOG("Using Android 10 native GPU layering");
 
@@ -1843,38 +1875,6 @@ ExecuteResult AndroidRemoteServer::ExecuteAndInject(const rdcstr &packageAndActi
     Android::adbExecCommand(m_deviceID, "push \"" + FileIO::GetAppFolderFilename("renderdoc.conf") +
                                             "\" /sdcard/Android/" + folderName + processName +
                                             "/files/renderdoc.conf");
-
-    rdcstr installedPath = Android::GetPathForPackage(m_deviceID, packageName);
-
-    rdcstr RDCLib = Android::adbExecCommand(m_deviceID, "shell ls " + installedPath +
-                                                            "/lib/*/" RENDERDOC_ANDROID_LIBRARY)
-                        .strStdout.trimmed();
-
-    if(Android_Debug_ProcessLaunch())
-    {
-      RDCLOG("Checking for existing library, found '%s'", RDCLib.c_str());
-    }
-    // some versions of adb/android return the error message on stdout, so try to detect those and
-    // clear the output.
-    if(RDCLib.size() < installedPath.size() || RDCLib.substr(0, installedPath.size()) != installedPath)
-      RDCLib.clear();
-
-    // some versions of adb/android also don't print any error message at all! Look to see if the
-    // wildcard glob is still present.
-    if(RDCLib.find("/lib/*/" RENDERDOC_ANDROID_LIBRARY) >= 0)
-      RDCLib.clear();
-
-    if(RDCLib.empty())
-    {
-      RDCLOG("No library found in %s/lib/*/" RENDERDOC_ANDROID_LIBRARY
-             " for %s - assuming injection is required.",
-             installedPath.c_str(), packageName.c_str());
-    }
-    else
-    {
-      hookWithJDWP = false;
-      RDCLOG("Library found, no injection required: %s", RDCLib.c_str());
-    }
 
     int pid = 0;
 

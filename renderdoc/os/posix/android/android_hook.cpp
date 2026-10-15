@@ -579,6 +579,40 @@ typedef struct VkLayerDeviceCreateInfo_ {
   } u;
 } VkLayerDeviceCreateInfo;
 
+// The loader searches the app's data dir and the native library dir for a file named after the
+// layer. With the no-layer (PLT) deployment the library lives under a neutral name, so even if
+// the host left debug-layer settings behind, the loader cannot actually load us as a layer - and
+// treating those leftover settings as 'layer mode active' would break capture entirely.
+static bool VulkanLayerFileExists()
+{
+  // check next to our own library (the loader searches the app's native library dir)
+  Dl_info info = {};
+  if(dladdr((void *)&VulkanLayerFileExists, &info) && info.dli_fname && info.dli_fname[0] != '\0')
+  {
+    rdcstr nextToUs = info.dli_fname;
+    const char *slash = strrchr(nextToUs.c_str(), '/');
+    if(slash)
+    {
+      nextToUs.resize(slash - nextToUs.c_str() + 1);
+      nextToUs += "libVkLayer_RENDERDOC_Capture.so";
+      if(access(nextToUs.c_str(), F_OK) == 0)
+        return true;
+    }
+  }
+
+  // check the app's data dir (the loader searches it first)
+  rdcstr package;
+  FileIO::GetExecutableFilename(package);
+  if(!package.empty())
+  {
+    rdcstr inDataDir = "/data/user/0/" + package + "/libVkLayer_RENDERDOC_Capture.so";
+    if(access(inDataDir.c_str(), F_OK) == 0)
+      return true;
+  }
+
+  return false;
+}
+
 // The host activates the loader's layer path via system properties (and the gpu_debug_*
 // settings, which can't be read from inside the app process). If any of the properties is set,
 // we must stay in layer mode even before negotiation with our own layer has happened
@@ -591,11 +625,15 @@ static bool AndroidVKLayerSettingsActive()
   // the host sets this when activating the loader's layer path
   if(__system_property_get("debug.vulkan.layers", value) > 0 && value[0] != '\0' &&
      strcmp(value, ":") != 0)
-    return true;
+  {
+    // only treat layer mode as active if the loader can actually find the layer library -
+    // otherwise the settings are leftovers and we must stay in PLT mode
+    return VulkanLayerFileExists();
+  }
 
   // some loaders read this one instead
   if(__system_property_get("debug.vulkan.gpu_debug_layers", value) > 0 && value[0] != '\0')
-    return true;
+    return VulkanLayerFileExists();
 
   return false;
 }

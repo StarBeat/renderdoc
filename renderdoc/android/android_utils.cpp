@@ -151,6 +151,14 @@ rdcstr GetPathForPackage(const rdcstr &deviceID, const rdcstr &packageName)
 {
   rdcstr pkgPath = adbExecCommand(deviceID, "shell pm path " + packageName).strStdout.trimmed();
 
+  // Some ROMs hide packages from the shell's package manager (the game doesn't appear in 'pm
+  // path' output even though it's installed). With root, query the package manager as root.
+  if(pkgPath.empty() && HasRootAccess(deviceID))
+  {
+    pkgPath =
+        adbExecCommand(deviceID, "shell su -c 'pm path " + packageName + "'").strStdout.trimmed();
+  }
+
   // if there are multiple slices, the path will be returned on many lines. Take only the first
   // line, assuming all of the apks are in the same directory
   if(pkgPath.find("\n") >= 0)
